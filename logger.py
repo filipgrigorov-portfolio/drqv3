@@ -12,16 +12,16 @@ import torchvision
 from termcolor import colored
 from torch.utils.tensorboard import SummaryWriter
 
-COMMON_TRAIN_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
-                       ('episode', 'E', 'int'), ('episode_length', 'L', 'int'),
-                       ('episode_reward', 'R', 'float'),
+COMMON_TRAIN_FORMAT = [('frame', 'Frame', 'int'), ('step', 'Step', 'int'),
+                       ('episode', 'Episode', 'int'), ('episode_length', 'Len', 'int'),
+                       ('episode_reward', 'Reward', 'float'),
                        ('buffer_size', 'BS', 'int'), ('fps', 'FPS', 'float'),
-                       ('total_time', 'T', 'time')]
+                       ('total_time', 'Time', 'time')]
 
-COMMON_EVAL_FORMAT = [('frame', 'F', 'int'), ('step', 'S', 'int'),
-                      ('episode', 'E', 'int'), ('episode_length', 'L', 'int'),
-                      ('episode_reward', 'R', 'float'),
-                      ('total_time', 'T', 'time')]
+COMMON_EVAL_FORMAT = [('frame', 'Frame', 'int'), ('step', 'Step', 'int'),
+                      ('episode', 'Episode', 'int'), ('episode_length', 'Len', 'int'),
+                      ('episode_reward', 'Reward', 'float'),
+                      ('total_time', 'Time', 'time')]
 
 
 class AverageMeter(object):

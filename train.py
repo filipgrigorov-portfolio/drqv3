@@ -41,9 +41,12 @@ class Workspace:
         self.device = torch.device(cfg.device)
         self.setup()
 
-        self.agent = make_agent(self.train_env.observation_spec(),
-                                self.train_env.action_spec(),
-                                self.cfg.agent)
+        self.agent = make_agent(
+            self.train_env.observation_spec(),
+            self.train_env.action_spec(),
+            self.cfg.agent
+        )
+        
         self.timer = utils.Timer()
         self._global_step = 0
         self._global_episode = 0
@@ -52,18 +55,22 @@ class Workspace:
         # create logger
         self.logger = Logger(self.work_dir, use_tb=self.cfg.use_tb)
         # create envs
-        self.train_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
-                                  self.cfg.action_repeat, self.cfg.seed)
-        self.eval_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack,
-                                 self.cfg.action_repeat, self.cfg.seed)
-        # create replay buffer
-        data_specs = (self.train_env.observation_spec(),
-                      self.train_env.action_spec(),
-                      specs.Array((1,), np.float32, 'reward'),
-                      specs.Array((1,), np.float32, 'discount'))
+        self.train_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack, self.cfg.action_repeat, self.cfg.seed)
+        self.eval_env = dmc.make(self.cfg.task_name, self.cfg.frame_stack, self.cfg.action_repeat, self.cfg.seed)
 
-        self.replay_storage = ReplayBufferStorage(data_specs,
-                                                  self.work_dir / 'buffer')
+        # NOTE (informative): create replay buffer
+        s = self.train_env.observation_spec()
+        a = self.train_env.action_spec()
+        r = specs.Array((1,), np.float32, 'reward')
+        gamma = specs.Array((1,), np.float32, 'discount')
+        data_specs = (
+            s,
+            a,
+            r,
+            gamma
+        )
+
+        self.replay_storage = ReplayBufferStorage(data_specs, self.work_dir / 'buffer')
 
         self.replay_loader = make_replay_loader(
             self.work_dir / 'buffer', self.cfg.replay_buffer_size,
@@ -123,19 +130,19 @@ class Workspace:
 
     def train(self):
         # predicates
-        train_until_step = utils.Until(self.cfg.num_train_frames,
-                                       self.cfg.action_repeat)
-        seed_until_step = utils.Until(self.cfg.num_seed_frames,
-                                      self.cfg.action_repeat)
-        eval_every_step = utils.Every(self.cfg.eval_every_frames,
-                                      self.cfg.action_repeat)
+        train_until_step = utils.Until(self.cfg.num_train_frames, self.cfg.action_repeat)
+        seed_until_step = utils.Until(self.cfg.num_seed_frames, self.cfg.action_repeat)
+        eval_every_step = utils.Every(self.cfg.eval_every_frames, self.cfg.action_repeat)
 
         episode_step, episode_reward = 0, 0
         time_step = self.train_env.reset()
+        # NOTE (informative): REPLAY BUFFER ADDITION
         self.replay_storage.add(time_step)
+
         self.train_video_recorder.init(time_step.observation)
         metrics = None
         while train_until_step(self.global_step):
+
             if time_step.last():
                 self._global_episode += 1
                 self.train_video_recorder.save(f'{self.global_frame}.mp4')
@@ -176,7 +183,7 @@ class Workspace:
                                         self.global_step,
                                         eval_mode=False)
 
-            # try to update the agent
+            # NOTE (informative): try to update the agent (UPDATE)
             if not seed_until_step(self.global_step):
                 metrics = self.agent.update(self.replay_iter, self.global_step)
                 self.logger.log_metrics(metrics, self.global_frame, ty='train')
@@ -185,6 +192,8 @@ class Workspace:
             time_step = self.train_env.step(action)
             episode_reward += time_step.reward
             self.replay_storage.add(time_step)
+
+
             self.train_video_recorder.record(time_step.observation)
             episode_step += 1
             self._global_step += 1

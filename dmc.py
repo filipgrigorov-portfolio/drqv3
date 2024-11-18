@@ -7,9 +7,14 @@ from typing import Any, NamedTuple
 
 import dm_env
 import numpy as np
-from dm_control import manipulation, suite
+from dm_control import manipulation, suite, viewer
 from dm_control.suite.wrappers import action_scale, pixels
 from dm_env import StepType, specs
+#from dm_control import _render
+#_render.BACKEND = 'glfw'
+
+STAGE_1 = True
+STAGE_2 = False
 
 
 class ExtendedTimeStep(NamedTuple):
@@ -66,6 +71,7 @@ class ActionRepeatWrapper(dm_env.Environment):
 
 
 class FrameStackWrapper(dm_env.Environment):
+    """"""
     def __init__(self, env, num_frames, pixels_key='pixels'):
         self._env = env
         self._num_frames = num_frames
@@ -85,6 +91,69 @@ class FrameStackWrapper(dm_env.Environment):
                                             minimum=0,
                                             maximum=255,
                                             name='observation')
+
+    def _transform_observation(self, time_step):
+        assert len(self._frames) == self._num_frames
+        obs = np.concatenate(list(self._frames), axis=0)
+        return time_step._replace(observation=obs)
+
+    def _extract_pixels(self, time_step):
+        pixels = time_step.observation[self._pixels_key]
+        # remove batch dim
+        if len(pixels.shape) == 4:
+            pixels = pixels[0]
+        return pixels.transpose(2, 0, 1).copy()
+
+    def reset(self):
+        time_step = self._env.reset()
+        pixels = self._extract_pixels(time_step)
+        for _ in range(self._num_frames):
+            self._frames.append(pixels)
+        return self._transform_observation(time_step)
+
+    def step(self, action):
+        time_step = self._env.step(action)
+        pixels = self._extract_pixels(time_step)
+        self._frames.append(pixels)
+        return self._transform_observation(time_step)
+
+    def observation_spec(self):
+        return self._obs_spec
+
+    def action_spec(self):
+        return self._env.action_spec()
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
+    
+
+class FrameStackAndStatesWrapper(dm_env.Environment):
+    """"""
+    def __init__(self, env, num_frames, pixels_keys=['position', 'velocity', 'pixels']):
+        self._env = env
+        self._num_frames = num_frames
+        self._frames = deque([], maxlen=num_frames)
+        self._pixels_keys = pixels_keys
+
+        wrapped_obs_spec = env.observation_spec()
+        pixels_key = pixels_keys[-1]
+        assert pixels_key in wrapped_obs_spec
+
+        states_shape = np.sum([ wrapped_obs_spec[pixels_keys[i]].shape for i in range(len(pixels_keys) - 1) ], axis=0)[0]
+        pixels_shape = wrapped_obs_spec[pixels_keys[-1]].shape
+        # remove batch dim
+        if len(pixels_shape) == 4:
+            pixels_shape = pixels_shape[1:]
+
+        img_shape = np.concatenate([[pixels_shape[2] * num_frames], pixels_shape[:2]], axis=0)
+        flat_img_shape = img_shape[0] * img_shape[1] * img_shape[2]
+        flat_obs_shape = flat_img_shape + states_shape
+        self._obs_spec = specs.BoundedArray(shape=[flat_obs_shape, ],
+                                            dtype=np.float32,
+                                            minimum=np.inf,
+                                            maximum=np.inf,
+                                            name='observation')
+        print(self._obs_spec)
 
     def _transform_observation(self, time_step):
         assert len(self._frames) == self._num_frames
@@ -149,6 +218,7 @@ class ActionDTypeWrapper(dm_env.Environment):
 
 
 class ExtendedTimeStepWrapper(dm_env.Environment):
+    """"""
     def __init__(self, env):
         self._env = env
 
@@ -205,9 +275,16 @@ def make(name, frame_stack, action_repeat, seed):
         camera_id = dict(quadruped=2).get(domain, 0)
         render_kwargs = dict(height=84, width=84, camera_id=camera_id)
         env = pixels.Wrapper(env,
-                             pixels_only=True,
+                             pixels_only=False, # NOTE (informative) if True only rgb else it will include the states as well
                              render_kwargs=render_kwargs)
     # stack several frames
-    env = FrameStackWrapper(env, frame_stack, pixels_key)
+    if STAGE_1:
+        env = FrameStackAndStatesWrapper(env, frame_stack)
+    elif STAGE_2:
+        env = FrameStackWrapper(env, frame_stack, pixels_key)
+    else:
+        raise("Not supported wrapper")
+    
     env = ExtendedTimeStepWrapper(env)
+    #viewer.launch(env) # debug
     return env

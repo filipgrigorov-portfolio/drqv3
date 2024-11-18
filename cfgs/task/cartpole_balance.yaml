@@ -1,5 +1,5 @@
 defaults:
-  - easy
+  - very_easy
   - _self_
 
 task_name: cartpole_balance

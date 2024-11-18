@@ -10,6 +10,11 @@ import torch.nn.functional as F
 
 import utils
 
+from models import *
+
+# TODO: Place in cli args
+STAGE_1 = True
+STAGE_2 = False
 
 class RandomShiftsAug(nn.Module):
     def __init__(self, pad):
@@ -45,82 +50,6 @@ class RandomShiftsAug(nn.Module):
                              align_corners=False)
 
 
-class Encoder(nn.Module):
-    def __init__(self, obs_shape):
-        super().__init__()
-
-        assert len(obs_shape) == 3
-        self.repr_dim = 32 * 35 * 35
-
-        self.convnet = nn.Sequential(nn.Conv2d(obs_shape[0], 32, 3, stride=2),
-                                     nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
-                                     nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
-                                     nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
-                                     nn.ReLU())
-
-        self.apply(utils.weight_init)
-
-    def forward(self, obs):
-        obs = obs / 255.0 - 0.5
-        h = self.convnet(obs)
-        h = h.view(h.shape[0], -1)
-        return h
-
-
-class Actor(nn.Module):
-    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim):
-        super().__init__()
-
-        self.trunk = nn.Sequential(nn.Linear(repr_dim, feature_dim),
-                                   nn.LayerNorm(feature_dim), nn.Tanh())
-
-        self.policy = nn.Sequential(nn.Linear(feature_dim, hidden_dim),
-                                    nn.ReLU(inplace=True),
-                                    nn.Linear(hidden_dim, hidden_dim),
-                                    nn.ReLU(inplace=True),
-                                    nn.Linear(hidden_dim, action_shape[0]))
-
-        self.apply(utils.weight_init)
-
-    def forward(self, obs, std):
-        h = self.trunk(obs)
-
-        mu = self.policy(h)
-        mu = torch.tanh(mu)
-        std = torch.ones_like(mu) * std
-
-        dist = utils.TruncatedNormal(mu, std)
-        return dist
-
-
-class Critic(nn.Module):
-    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim):
-        super().__init__()
-
-        self.trunk = nn.Sequential(nn.Linear(repr_dim, feature_dim),
-                                   nn.LayerNorm(feature_dim), nn.Tanh())
-
-        self.Q1 = nn.Sequential(
-            nn.Linear(feature_dim + action_shape[0], hidden_dim),
-            nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True), nn.Linear(hidden_dim, 1))
-
-        self.Q2 = nn.Sequential(
-            nn.Linear(feature_dim + action_shape[0], hidden_dim),
-            nn.ReLU(inplace=True), nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True), nn.Linear(hidden_dim, 1))
-
-        self.apply(utils.weight_init)
-
-    def forward(self, obs, action):
-        h = self.trunk(obs)
-        h_action = torch.cat([h, action], dim=-1)
-        q1 = self.Q1(h_action)
-        q2 = self.Q2(h_action)
-
-        return q1, q2
-
-
 class DrQV2Agent:
     def __init__(self, obs_shape, action_shape, device, lr, feature_dim,
                  hidden_dim, critic_target_tau, num_expl_steps,
@@ -134,38 +63,65 @@ class DrQV2Agent:
         self.stddev_clip = stddev_clip
 
         # models
-        self.encoder = Encoder(obs_shape).to(device)
-        self.actor = Actor(self.encoder.repr_dim, action_shape, feature_dim,
-                           hidden_dim).to(device)
+        # Encoder
+        if STAGE_1:
+            # flat shape as we need 9 rgbs + states
+            image_shape = (9, 84, 84)
+            flat_image_shape = image_shape[0] * image_shape[1] * image_shape[2]
+            state_shape = (obs_shape - flat_image_shape)
+            self.image_encoder = StateEncoder(state_shape).to(device)
+            self.image_encoder = ImageEncoder(image_shape).to(device)
+        elif STAGE_2:
+            # image only with the right shape (not flat)
+            self.image_encoder = ImageEncoder(obs_shape).to(device)
 
-        self.critic = Critic(self.encoder.repr_dim, action_shape, feature_dim,
-                             hidden_dim).to(device)
-        self.critic_target = Critic(self.encoder.repr_dim, action_shape,
-                                    feature_dim, hidden_dim).to(device)
+        # Actor policy
+        self.actor = Actor(self.image_encoder.repr_dim, action_shape, feature_dim, hidden_dim).to(device)
+
+        # Critic policy
+        self.critic = Critic(self.image_encoder.repr_dim, action_shape, feature_dim, hidden_dim).to(device)
+        
+        # NOTE: These are updated every now and then via EMA (2 target critic networks)
+        self.critic_target = Critic(self.image_encoder.repr_dim, action_shape, feature_dim, hidden_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        # optimizers
-        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=lr)
+
+        # NOTE: cVAE framework (conditioned on action_shape)
+        if STAGE_1:
+            self.reconstructor = cVAE(input_shape=image_shape, latent_dim=128, context_dim=action_shape, freeze_encoder=STAGE_2)
+        elif STAGE_2:
+            self.reconstructor = cVAE(input_shape=obs_shape, latent_dim=128, context_dim=action_shape, freeze_encoder=STAGE_2)
+
+
+
+        # NOTE (informative): optimizers
+        self.image_encoder_opt = torch.optim.Adam(self.image_encoder.parameters(), lr=lr)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        self.cVAE_opt = torch.optim.Adam(self.reconstructor.parameters(), lr=lr) # NOTE (informative)
 
+
+
+        # TODO: to be replaced by the states from cVAE when training on visual input
         # data augmentation
         self.aug = RandomShiftsAug(pad=4)
+
+
 
         self.train()
         self.critic_target.train()
 
     def train(self, training=True):
         self.training = training
-        self.encoder.train(training)
+        self.image_encoder.train(training)
         self.actor.train(training)
         self.critic.train(training)
 
     def act(self, obs, step, eval_mode):
         obs = torch.as_tensor(obs, device=self.device)
-        obs = self.encoder(obs.unsqueeze(0))
+        obs = self.image_encoder(obs.unsqueeze(0)) # IMG ENCODING -> STATES ENCODING 
         stddev = utils.schedule(self.stddev_schedule, step)
-        dist = self.actor(obs, stddev)
+        dist = self.actor(obs, stddev) # ACTOR POLICY
         if eval_mode:
             action = dist.mean
         else:
@@ -194,12 +150,14 @@ class DrQV2Agent:
             metrics['critic_q2'] = Q2.mean().item()
             metrics['critic_loss'] = critic_loss.item()
 
-        # optimize encoder and critic
-        self.encoder_opt.zero_grad(set_to_none=True)
+        # NOTE (informative): optimize encoder and critic
+        self.image_encoder_opt.zero_grad(set_to_none=True)
         self.critic_opt.zero_grad(set_to_none=True)
+
         critic_loss.backward()
+        
         self.critic_opt.step()
-        self.encoder_opt.step()
+        self.image_encoder_opt.step()
 
         return metrics
 
@@ -215,15 +173,40 @@ class DrQV2Agent:
 
         actor_loss = -Q.mean()
 
-        # optimize actor
+        # NOTE (informative): optimize actor
         self.actor_opt.zero_grad(set_to_none=True)
+
         actor_loss.backward()
+        
         self.actor_opt.step()
 
         if self.use_tb:
             metrics['actor_loss'] = actor_loss.item()
             metrics['actor_logprob'] = log_prob.mean().item()
             metrics['actor_ent'] = dist.entropy().sum(dim=-1).mean().item()
+
+        return metrics
+    
+    def update_reconstruction(self, obs, step):
+        metrics = dict()
+
+        obs_reconstructed, mu, logvar = self.reconstructor(x=obs)
+        reconstruction_loss = compute_reconstruction_loss(reconstructed=obs_reconstructed, original=obs)
+
+        self.cVAE_opt.zero_grad()
+
+        reconstruction_loss.backward()
+
+        self.cVAE_opt.step()
+
+        if self.use_tb:
+            variance = torch.exp(logvar)
+            std_dev = torch.sqrt(variance)
+
+            metrics("Distribution/Mean", mu.mean().item())
+            metrics("Distribution/Variance", variance.mean().item())
+            metrics("Distribution/StdDev", std_dev.mean().item())
+            metrics['reconstruction_loss'] = reconstruction_loss.item()
 
         return metrics
 
@@ -237,13 +220,14 @@ class DrQV2Agent:
         obs, action, reward, discount, next_obs = utils.to_torch(
             batch, self.device)
 
-        # augment
+        # NOTE (informative): augment -> replace with cVAE in the replay buffer
         obs = self.aug(obs.float())
         next_obs = self.aug(next_obs.float())
+
         # encode
-        obs = self.encoder(obs)
+        obs = self.image_encoder(obs)
         with torch.no_grad():
-            next_obs = self.encoder(next_obs)
+            next_obs = self.image_encoder(next_obs)
 
         if self.use_tb:
             metrics['batch_reward'] = reward.mean().item()
@@ -258,5 +242,9 @@ class DrQV2Agent:
         # update critic target
         utils.soft_update_params(self.critic, self.critic_target,
                                  self.critic_target_tau)
+        
+        # update reconstruction
+        if STAGE_1:
+            metrics.update(self.update_reconstruction(obs.detach(), step))
 
         return metrics
