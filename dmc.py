@@ -134,10 +134,11 @@ class FrameStackAndStatesWrapper(dm_env.Environment):
         self._num_frames = num_frames
         self._frames = deque([], maxlen=num_frames)
         self._pixels_keys = pixels_keys
+        self._states = []
 
         wrapped_obs_spec = env.observation_spec()
-        pixels_key = pixels_keys[-1]
-        assert pixels_key in wrapped_obs_spec
+        self._pixels_key = pixels_keys[-1]
+        assert self._pixels_key in wrapped_obs_spec
 
         states_shape = np.sum([ wrapped_obs_spec[pixels_keys[i]].shape for i in range(len(pixels_keys) - 1) ], axis=0)[0]
         pixels_shape = wrapped_obs_spec[pixels_keys[-1]].shape
@@ -157,8 +158,11 @@ class FrameStackAndStatesWrapper(dm_env.Environment):
 
     def _transform_observation(self, time_step):
         assert len(self._frames) == self._num_frames
-        obs = np.concatenate(list(self._frames), axis=0)
-        return time_step._replace(observation=obs)
+        images = np.concatenate(list(self._frames), axis=0)
+        images = images.flatten().astype(np.float32)
+        obs = np.concatenate([images, self._states], axis=0)
+        updated_time_step = time_step._replace(observation=obs)
+        return updated_time_step
 
     def _extract_pixels(self, time_step):
         pixels = time_step.observation[self._pixels_key]
@@ -166,18 +170,24 @@ class FrameStackAndStatesWrapper(dm_env.Environment):
         if len(pixels.shape) == 4:
             pixels = pixels[0]
         return pixels.transpose(2, 0, 1).copy()
+    
+    def _extract_states(self, time_step):
+        states = np.concatenate([ time_step.observation[self._pixels_keys[i]] for i in range(len(self._pixels_keys)-1) ])
+        return states.astype(np.float32)
 
     def reset(self):
         time_step = self._env.reset()
         pixels = self._extract_pixels(time_step)
         for _ in range(self._num_frames):
             self._frames.append(pixels)
+        self._states = self._extract_states(time_step)
         return self._transform_observation(time_step)
 
     def step(self, action):
         time_step = self._env.step(action)
         pixels = self._extract_pixels(time_step)
         self._frames.append(pixels)
+        self._states = self._extract_states(time_step)
         return self._transform_observation(time_step)
 
     def observation_spec(self):

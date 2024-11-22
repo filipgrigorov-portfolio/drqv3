@@ -179,7 +179,8 @@ class cVAE(nn.Module):
         
         # Decoder
         self.fc_decode = nn.Linear(latent_dim + context_dim, encoder_out_dim)
-        self.decoder = ImageDecoder(obs_shape=input_shape) #TODO
+        #self.mlp_reward = nn.Linear(encoder_out_dim, 1)
+        self.decoder = ImageDecoder(obs_shape=input_shape)
     
     def forward(self, x, context=None):
         batch_size = x.size(0)
@@ -193,29 +194,37 @@ class cVAE(nn.Module):
         logvar = self.fc_logvar(encoded)
         
         # Reparameterization trick
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z = mu + eps * std
+        var = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(var)
+        z = mu + eps * var
         
         # Decode
         if context is not None:
             z = torch.cat([z, context], dim=-1)
         
         decoded = self.fc_decode(z)
-        decoded = decoded.view(self.last_enc_layer_shape)  # Reshape to match decoder
+        #reward_pred = self.mlp_reward(decoded)
+        reward_pred = None
+        decoded = decoded.view(-1, self.last_enc_layer_shape[1], self.last_enc_layer_shape[2], self.last_enc_layer_shape[3])  # Reshape to match decoder
         reconstructed = self.decoder(decoded)
-        return reconstructed, mu, logvar
+        return reconstructed, mu, logvar, z, reward_pred
 
+
+def relative_mse_loss(reconstructed, target, epsilon=1e-8):
+    """Compute relative MSE loss."""
+    relative_error = (reconstructed - target) / (target + epsilon)
+    return torch.mean(relative_error ** 2)
 
 # Reconstruction Loss and KL Divergence
-def compute_reconstruction_loss(reconstructed, original, mu, logvar):
+def compute_reconstruction_loss(reconstructed, original, mu, logvar, kl_weight=0.01):
     # Reconstruction loss (pixel-wise MSE)
-    recon_loss = F.mse_loss(reconstructed, original, reduction='mean')
+    #recon_loss = F.mse_loss(reconstructed, original, reduction='mean')
+    recon_loss = relative_mse_loss(reconstructed, original)
     
     # KL Divergence loss
     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / original.size(0)
     
-    return recon_loss + kl_loss
+    return recon_loss + kl_weight * kl_loss, recon_loss, kl_loss
 
 
 def test_states_encoder():
