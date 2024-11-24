@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import utils
 
 from models import *
+from losses import *
 
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
@@ -22,10 +23,11 @@ from PIL import Image
 STAGE_1 = True
 STAGE_2 = False
 
-LOG_EVERY = 50000
+LOG_EVERY = 30000
 
-LAMBDA = 0.1 # reward loss weight
-GAMMA = 0.9 # reward_pred vs reward
+REWARD_LOSS_WEIGHT = 0.3 # reward loss weight
+GAMMA = 0.7 # reward_pred vs reward (NOT quite working)
+PLOT_LATENT = False
 
 class RandomShiftsAug(nn.Module):
     def __init__(self, pad):
@@ -107,7 +109,9 @@ class DrQV2Agent:
         elif STAGE_2:
             self.reconstructor = cVAE(input_shape=obs_shape, latent_dim=128, context_dim=action_shape[0], freeze_encoder=STAGE_2).to(device)
 
+        self.reward_pred = None
 
+        self.ssim_loss_fn = SSIMLoss(window_size=11, channel=3, reduction='mean').to(device)  # experiment
 
         # NOTE (informative): optimizers
         self.image_encoder_opt = torch.optim.Adam(self.image_encoder.parameters(), lr=lr)
@@ -162,15 +166,19 @@ class DrQV2Agent:
             next_action = dist.sample(clip=self.stddev_clip)
             target_Q1, target_Q2 = self.critic_target(next_obs, next_action)
             target_V = torch.min(target_Q1, target_Q2)
+            reward_loss = 0.0
             if reward_pred is not None:
-                reward_loss = torch.nn.functional.mse_loss(reward, reward_pred)
-            #reward = torch.min(reward, reward_pred) # experiment (lower bound)
-            #reward = GAMMA * reward + (1.0 - GAMMA) * reward_pred
+                reward_normalized = F.tanh(reward)
+                reward_pred_normalized = F.tanh(reward_pred)
+                reward_loss = torch.nn.functional.huber_loss(reward_normalized, reward_pred_normalized, reduction="mean")
+                #reward = torch.min(reward, reward_pred) # experiment (lower bound)
+                reward = GAMMA * reward + (1.0 - GAMMA) * reward_pred
+
             target_Q = reward + (discount * target_V)
         
         Q1, Q2 = self.critic(obs, action)
 
-        critic_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)# + LAMBDA * reward_loss
+        critic_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q) + REWARD_LOSS_WEIGHT * reward_loss
 
         if self.use_tb:
             if reward_pred is not None:
@@ -192,7 +200,7 @@ class DrQV2Agent:
         self.critic_opt.step()
         self.image_encoder_opt.step()
 
-        return metrics
+        return metrics, reward_loss
 
     def update_actor(self, obs, step):
         metrics = dict()
@@ -222,55 +230,65 @@ class DrQV2Agent:
 
         return metrics
     
-    def update_reconstruction(self, obs, actions, step, num_steps):
+    def update_reconstruction(self, obs, actions, reward_loss, step, num_steps):
         metrics = dict()
 
         obs = obs[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2]) if STAGE_1 else obs # Extract for stage 1 and use as is for stage 2 (images only)
 
-        obs_reconstructed, mu, logvar, z, reward_pred = self.reconstructor(x=obs, context=actions)
-        kl_weight = 1.0 #min(step / int(0.9 * num_steps), 1.0)
+        action_normalized = actions / actions.norm(dim=-1, keepdim=True)
+        obs_reconstructed, mu, logvar, z, reward_pred = self.reconstructor(x=obs, context=action_normalized)
+        kl_weight = min(step / int(0.7 * num_steps), 1.0)
         reconstruction_loss, recon_loss, kl_loss = compute_reconstruction_loss(reconstructed=obs_reconstructed, original=obs, mu=mu, logvar=logvar, kl_weight=kl_weight)
+        ssim_loss = 0.0
+        for i in range(0, obs.shape[1] // 3):
+            ssim_loss += self.ssim_loss_fn(obs_reconstructed[:, i*3:(i+1)*3, ...], obs[:, i*3:(i+1)*3, ...]) # experiment
+        ssim_loss /= obs.shape[1]
+
+        total_loss = reconstruction_loss + REWARD_LOSS_WEIGHT * reward_loss
 
         self.cVAE_opt.zero_grad()
 
-        reconstruction_loss.backward()
+        total_loss.backward()
 
         self.cVAE_opt.step()
 
         if self.use_tb:
             variance = torch.exp(0.5 * logvar)
-            std_dev = torch.sqrt(variance)
+            #std_dev = torch.sqrt(variance)
 
             metrics["cVAE/recon_loss"] = recon_loss.mean().item()
             metrics["cVAE/kl_loss"] = kl_loss.mean().item()
+            metrics["cVAE/ssim_loss"] = ssim_loss.mean().item()
+
             metrics["cVAE/distribution_mean"] = mu.mean().item()
             metrics["cVAE/distribution_variance"] = variance.mean().item()
             #metrics["cVAE/distribution_stddev"] = std_dev.mean().item()
-            metrics["cVAE/reconstruction_loss"] = reconstruction_loss.item()
+            metrics["cVAE/total_loss"] = total_loss.item()
 
             if step == 0 or step % LOG_EVERY == 0:
                 metrics["cVAE/original_images"] = obs[:3, :3, ...]
                 metrics["cVAE/reconstructed_images"] = obs_reconstructed[:3, :3, ...]
 
-                latent_vectors_normalized = self.scaler.fit_transform(z.detach().cpu().numpy())
-                latent_2d = self.tsne.fit_transform(latent_vectors_normalized)
-                
-                fig, ax = plt.subplots(figsize=(8, 6))
-                scatter = ax.scatter(latent_2d[:, 0], latent_2d[:, 1], s=10, alpha=0.7)
-                plt.title("t-SNE Visualization of cVAE Latent Space")
-                plt.xlabel("t-SNE Dimension 1")
-                plt.ylabel("t-SNE Dimension 2")
+                if PLOT_LATENT:
+                    latent_vectors_normalized = self.scaler.fit_transform(z.detach().cpu().numpy())
+                    latent_2d = self.tsne.fit_transform(latent_vectors_normalized)
+                    
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    scatter = ax.scatter(latent_2d[:, 0], latent_2d[:, 1], s=10, alpha=0.7)
+                    plt.title("t-SNE Visualization of cVAE Latent Space")
+                    plt.xlabel("t-SNE Dimension 1")
+                    plt.ylabel("t-SNE Dimension 2")
 
-                # Convert plot to a numpy array
-                buf = io.BytesIO()
-                plt.savefig(buf, format='png')
-                buf.seek(0)
-                image = Image.open(buf)
-                image_array = np.array(image)
-                buf.close()
-                plt.close()
+                    # Convert plot to a numpy array
+                    buf = io.BytesIO()
+                    plt.savefig(buf, format='png')
+                    buf.seek(0)
+                    image = Image.open(buf)
+                    image_array = np.array(image)
+                    buf.close()
+                    plt.close()
 
-                metrics["cVAE/latent_space"] = image_array
+                    metrics["cVAE/latent_space"] = image_array
 
         return metrics, reward_pred
 
@@ -316,8 +334,8 @@ class DrQV2Agent:
         
 
         # update critic
-        metrics.update(
-            self.update_critic(obs, action, reward, None, discount, next_obs, step))
+        metrics_critic, reward_loss = self.update_critic(obs, action, reward, self.reward_pred, discount, next_obs, step)
+        metrics.update(metrics_critic)
 
         # update actor
         metrics.update(self.update_actor(obs.detach(), step))
@@ -325,11 +343,11 @@ class DrQV2Agent:
         # NOTE (important): This needs to be after the updates to the above policies to train properly!!!
         # update reconstruction
         if STAGE_1:
-            reconstruction_metrics, reward_pred = self.update_reconstruction(images.detach(), action, step, num_steps)
+            reconstruction_metrics, self.reward_pred = self.update_reconstruction(images.detach(), action, reward_loss, step, num_steps)
             metrics.update(reconstruction_metrics)
         elif STAGE_2:
             # might not be turned on
-            reconstruction_metrics, reward_pred = self.update_reconstruction(images.detach(), action, step, num_steps)
+            reconstruction_metrics, self.reward_pred = self.update_reconstruction(images.detach(), action, reward_loss, step, num_steps)
             metrics.update(reconstruction_metrics)
         else:
             raise("Just STAGE_1 and STAGE_2")
