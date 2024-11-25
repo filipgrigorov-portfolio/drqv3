@@ -180,10 +180,10 @@ class cVAE(nn.Module):
         # Decoder
         self.fc_decode = nn.Linear(latent_dim + context_dim, encoder_out_dim)
         self.mlp_reward = nn.Sequential(
-            nn.Linear(encoder_out_dim, 128),
-            nn.ELU(),
+            nn.Linear(latent_dim + context_dim, 128),
+            nn.ReLU(),
             nn.Linear(128, 32),
-            nn.ELU(),
+            nn.ReLU(),
             nn.Linear(32, 1),
         )
         self.decoder = ImageDecoder(obs_shape=input_shape)
@@ -209,10 +209,81 @@ class cVAE(nn.Module):
             z = torch.cat([z, context], dim=-1)
         
         decoded = self.fc_decode(z)
-        reward_pred = self.mlp_reward(decoded)
+        reward_pred = self.mlp_reward(z)
         decoded = decoded.view(-1, self.last_enc_layer_shape[1], self.last_enc_layer_shape[2], self.last_enc_layer_shape[3])  # Reshape to match decoder
         reconstructed = self.decoder(decoded)
         return reconstructed, mu, logvar, z, reward_pred
+    
+
+# Utils
+def compute_frame_difference(inputs, num_frames):
+    """
+    Compute absolute differences between consecutive frames.
+    Args:
+        inputs: [B, C*T, H, W] - Stacked frames
+        num_frames: int - Number of frames
+    Returns:
+        frame_diff: [B, T-1, C, H, W] - Frame differences
+    """
+    B, C_T, H, W = inputs.shape
+    T = num_frames
+    C = C_T // T
+
+    # Reshape to [B, T, C, H, W]
+    frames = inputs.view(B, T, C, H, W)
+
+    # Compute absolute differences between consecutive frames
+    frame_diff = torch.abs(frames[:, 1:] - frames[:, :-1])  # [B, T-1, C, H, W]
+    return frame_diff
+
+def create_dynamic_mask(frame_diff, threshold=None, mode="static"):
+    """
+    Create a mask based on frame differences.
+    Args:
+        frame_diff: [B, T-1, C, H, W] - Frame differences
+        threshold: float or None - Optional threshold for masking
+    Returns:
+        mask: [B, T-1, 1, H, W] - Binary mask highlighting dynamic regions
+    """
+    # Aggregate differences across the channel dimension
+    dynamic_score = frame_diff.mean(dim=2, keepdim=True)  # [B, T-1, 1, H, W]
+
+    # Apply thresholding or normalize to [0, 1]
+    if threshold is not None:
+        if mode == "dynamic":
+            mask = (dynamic_score > threshold).float()  # Binary mask
+        elif mode == "static":
+            mask = (dynamic_score <= threshold).float()  # Binary mask (of zeros)
+        else:
+            return dynamic_score / dynamic_score.max()
+    else:
+        mask = dynamic_score / dynamic_score.max()  # Soft mask in [0, 1]
+    return mask
+
+def mask_inputs_with_dynamic_regions(inputs, mask, num_frames):
+    """
+    Apply a mask to input frames for encoding.
+    Args:
+        inputs: [B, C*T, H, W] - Input frames
+        mask: [B, T-1, 1, H, W] - Dynamic mask
+        num_frames: int - Number of frames
+    Returns:
+        masked_inputs: Masked inputs
+    """
+    B, C_T, H, W = inputs.shape
+    T = num_frames
+    C = C_T // T
+
+    # Reshape inputs to [B, T, C, H, W]
+    inputs = inputs.view(B, T, C, H, W)
+
+    # Pad the mask to match the input shape
+    padded_mask = torch.cat([mask, torch.ones_like(mask[:, :1])], dim=1)  # [B, T, 1, H, W]
+
+    # Multiply mask with the input
+    masked_inputs = inputs * padded_mask
+    return masked_inputs.view(B, C_T, H, W)
+
 
 def test_states_encoder():
     raise NotImplementedError

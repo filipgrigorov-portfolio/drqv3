@@ -24,6 +24,7 @@ STAGE_1 = True
 STAGE_2 = False
 
 LOG_EVERY = 30000
+NUM_ACC_STEPS = 1000
 
 REWARD_LOSS_WEIGHT = 0.3 # reward loss weight
 GAMMA = 0.7 # reward_pred vs reward (NOT quite working)
@@ -111,13 +112,13 @@ class DrQV2Agent:
 
         self.reward_pred = None
 
-        self.ssim_loss_fn = SSIMLoss(window_size=11, channel=3, reduction='mean').to(device)  # experiment
+        self.ssim_loss_fn = SSIMLoss(window_size=11, channel=3, reduction='mean').to(device)
 
         # NOTE (informative): optimizers
         self.image_encoder_opt = torch.optim.Adam(self.image_encoder.parameters(), lr=lr)
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
-        LR_VAE = lr #1e-3
+        LR_VAE = 1e-3
         self.cVAE_opt = torch.optim.Adam(self.reconstructor.parameters(), lr=LR_VAE) # NOTE (informative)
 
 
@@ -235,21 +236,42 @@ class DrQV2Agent:
 
         obs = obs[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2]) if STAGE_1 else obs # Extract for stage 1 and use as is for stage 2 (images only)
 
+        # Mask in dynamic parts
+        frame_diff = compute_frame_difference(obs, num_frames=obs.shape[1] // 3)
+        mask = create_dynamic_mask(frame_diff=frame_diff, threshold=0.1, mode="dynamic")
+        obs_dynamic = mask_inputs_with_dynamic_regions(obs, mask, num_frames=obs.shape[1] // 3)
+        # ---
+        
+        # Mask in static parts
+        frame_diff = compute_frame_difference(obs, num_frames=obs.shape[1] // 3)
+        mask = create_dynamic_mask(frame_diff=frame_diff, threshold=0.1, mode="static")
+        obs_static = mask_inputs_with_dynamic_regions(obs, mask, num_frames=obs.shape[1] // 3)
+        # ---
+
         action_normalized = actions / actions.norm(dim=-1, keepdim=True)
-        obs_reconstructed, mu, logvar, z, reward_pred = self.reconstructor(x=obs, context=action_normalized)
+        obs_dynamic_reconstructed, mu_dynamic, logvar_dynamic, _, _ = self.reconstructor(x=obs_dynamic, context=action_normalized)
+        obs_static_reconstructed, mu, logvar, z, reward_pred = self.reconstructor(x=obs_static, context=action_normalized)
+
+
+
         kl_weight = min(step / int(0.7 * num_steps), 1.0)
-        reconstruction_loss, recon_loss, kl_loss = compute_reconstruction_loss(reconstructed=obs_reconstructed, original=obs, mu=mu, logvar=logvar, kl_weight=kl_weight)
+        reconstruction_loss_dynamic, _, _ = compute_reconstruction_loss(reconstructed=obs_dynamic_reconstructed, original=obs, mu=mu_dynamic, logvar=logvar_dynamic, kl_weight=kl_weight)
+        reconstruction_loss_static, recon_loss, kl_loss = compute_reconstruction_loss(reconstructed=obs_static_reconstructed, original=obs, mu=mu, logvar=logvar, kl_weight=kl_weight)
         ssim_loss = 0.0
         for i in range(0, obs.shape[1] // 3):
-            ssim_loss += self.ssim_loss_fn(obs_reconstructed[:, i*3:(i+1)*3, ...], obs[:, i*3:(i+1)*3, ...]) # experiment
-        ssim_loss /= obs.shape[1]
+            ssim_loss += self.ssim_loss_fn(obs_dynamic_reconstructed[:, i*3:(i+1)*3, ...], obs[:, i*3:(i+1)*3, ...])
+            ssim_loss += self.ssim_loss_fn(obs_static_reconstructed[:, i*3:(i+1)*3, ...], obs[:, i*3:(i+1)*3, ...])
+        ssim_loss /= (obs.shape[1] * 2)
 
-        total_loss = reconstruction_loss + REWARD_LOSS_WEIGHT * reward_loss
+        total_loss = reconstruction_loss_static + 0.3 * reconstruction_loss_dynamic + ssim_loss + REWARD_LOSS_WEIGHT * reward_loss
 
+        #if step % NUM_ACC_STEPS == NUM_ACC_STEPS - 1:
         self.cVAE_opt.zero_grad()
 
         total_loss.backward()
 
+        #if step % NUM_ACC_STEPS == NUM_ACC_STEPS - 1:
+            #nn.utils.clip_grad_norm_(self.reconstructor.parameters(), 5.0)
         self.cVAE_opt.step()
 
         if self.use_tb:
@@ -259,15 +281,19 @@ class DrQV2Agent:
             metrics["cVAE/recon_loss"] = recon_loss.mean().item()
             metrics["cVAE/kl_loss"] = kl_loss.mean().item()
             metrics["cVAE/ssim_loss"] = ssim_loss.mean().item()
+            metrics["cVAE/reconstruction_dynamic_loss"] = reconstruction_loss_dynamic.mean().item()
+            metrics["cVAE/reconstruction_static_loss"] = reconstruction_loss_static.mean().item()
 
             metrics["cVAE/distribution_mean"] = mu.mean().item()
             metrics["cVAE/distribution_variance"] = variance.mean().item()
             #metrics["cVAE/distribution_stddev"] = std_dev.mean().item()
             metrics["cVAE/total_loss"] = total_loss.item()
 
-            if step == 0 or step % LOG_EVERY == 0:
+            if step == 2000 or step % LOG_EVERY == 0:
+                metrics["cVAE/original_dynamic_images"] = obs_dynamic[:3, :3, ...]
                 metrics["cVAE/original_images"] = obs[:3, :3, ...]
-                metrics["cVAE/reconstructed_images"] = obs_reconstructed[:3, :3, ...]
+                metrics["cVAE/reconstructed_dynamic_images"] = obs_dynamic_reconstructed[:3, :3, ...]
+                metrics["cVAE/reconstructed_static_images"] = obs_static_reconstructed[:3, :3, ...]
 
                 if PLOT_LATENT:
                     latent_vectors_normalized = self.scaler.fit_transform(z.detach().cpu().numpy())
