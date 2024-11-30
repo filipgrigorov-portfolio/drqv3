@@ -147,12 +147,12 @@ class Logger(object):
         mg.log(key, value)
 
     def log_image(self, key, value, step):
-        #step = 0 # save some memory
+        step = 0 # save some memory
         grid_images_orig = torchvision.utils.make_grid(value, nrow=8, padding=2, normalize=True)
         self._sw.add_image(key, grid_images_orig, global_step=step)
 
     def log_plot(self, key, value, step):
-        #step = 0 # save some memory
+        step = 0 # save some memory
         self._sw.add_image(key, value, global_step=step, dataformats="HWC")
 
     def log_metrics(self, metrics, step, ty):
