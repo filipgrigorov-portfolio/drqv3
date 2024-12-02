@@ -3,9 +3,71 @@ import torch.nn as nn
 import torch.nn.functional as F
 import utils
 
-from torchvision.models import resnet18
+from torchvision.models import resnet18, vgg16
+from torchvision.transforms.functional import normalize
 
+class Swish(nn.Module):
+    def __init__(self):
+        super(Swish, self).__init__()
 
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+# class ImageEncoder(nn.Module):
+#     def __init__(self, obs_shape):
+#         super().__init__()
+
+#         assert len(obs_shape) == 3
+#         self.repr_dim = 32 * 35 * 35
+
+#         self.convnet = nn.Sequential(
+#             nn.Conv2d(obs_shape[0], 32, 3, stride=2),
+#             #nn.ReLU(), 
+#             Swish(),
+            
+#             nn.Conv2d(32, 32, 3, stride=1),
+#             #nn.ReLU(), 
+#             Swish(),
+            
+#             nn.Conv2d(32, 32, 3, stride=1),
+#             #nn.ReLU(), 
+#             Swish(),
+            
+#             nn.Conv2d(32, 32, 3, stride=1),
+#             #nn.ReLU()
+#             Swish()
+#         )
+
+#         self.apply(utils.weight_init)
+
+#     def forward(self, obs, flatten=True):
+#         obs = obs / 255.0 - 0.5
+#         h = self.convnet(obs)
+#         if flatten:
+#             h = h.view(h.shape[0], -1)
+#         return h
+    
+class ResidualBlock(nn.Module):
+    """
+    A single residual block that maintains the same spatial resolution.
+    """
+    def __init__(self, in_channels, out_channels):
+        super(ResidualBlock, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+
+        # Shortcut connection to match input and output dimensions
+        self.shortcut = (nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1) if in_channels != out_channels else nn.Identity())
+
+    def forward(self, x):
+        shortcut = self.shortcut(x)
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        out = self.relu(x + shortcut)
+        return out
 
 class ImageEncoder(nn.Module):
     def __init__(self, obs_shape):
@@ -16,16 +78,22 @@ class ImageEncoder(nn.Module):
 
         self.convnet = nn.Sequential(
             nn.Conv2d(obs_shape[0], 32, 3, stride=2),
-            nn.ReLU(), 
+            #ResidualBlock(32, 32),
+            #nn.ReLU(), 
+            Swish(),
             
             nn.Conv2d(32, 32, 3, stride=1),
-            nn.ReLU(), 
+            #ResidualBlock(32, 32),
+            #nn.ReLU(),
+            Swish(), 
             
             nn.Conv2d(32, 32, 3, stride=1),
-            nn.ReLU(), 
+            #ResidualBlock(32, 32),
+            #nn.ReLU(), 
+            Swish(),
             
             nn.Conv2d(32, 32, 3, stride=1),
-            nn.ReLU()
+            #ResidualBlock(32, 32),
         )
 
         self.apply(utils.weight_init)
@@ -36,31 +104,26 @@ class ImageEncoder(nn.Module):
         if flatten:
             h = h.view(h.shape[0], -1)
         return h
-    
 
-class ResNetEncoder(nn.Module):
-    def __init__(self, obs_shape):
-        super(ResNetEncoder, self).__init__()
 
-        assert len(obs_shape) == 3
-        self.repr_dim = 32 * 35 * 35
+class ResidualBlockTransConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, output_padding=0):
+        super(ResidualBlockTransConv, self).__init__()
 
-        self.resnet = resnet18(pretrained=True)
+        self.conv1 = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, output_padding)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.ConvTranspose2d(out_channels, out_channels, kernel_size, stride=1, padding=padding)
+        
 
-        self.resnet.conv1 = nn.Conv2d(obs_shape[0], 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.resnet = nn.Sequential(*list(self.resnet.children())[:-2])
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512, self.repr_dim)
+        self.shortcut = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=1, stride=1) if in_channels != out_channels else nn.Identity()
 
-    def forward(self, obs):
-        obs = obs / 255.0 - 0.5
-        h = self.resnet(obs)
-        h = self.pool(h)
-        h = torch.flatten(h, start_dim=1)
-        h = self.fc(h)
-        return h
+    def forward(self, x):
+        shortcut = self.shortcut(x)
+        x = self.relu(self.conv1(x))
+        x = self.conv2(x)
+        out = self.relu(x + shortcut)
+        return out
 
-    
 class ImageDecoder(nn.Module):
     def __init__(self, obs_shape):
         super().__init__()
@@ -69,15 +132,22 @@ class ImageDecoder(nn.Module):
         self.repr_dim = 32 * 35 * 35
 
         self.convnet = nn.Sequential(
+            #ResidualBlockTransConv(32, 32),
             nn.ConvTranspose2d(32, 32, kernel_size=3, stride=1),
-            
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 32, kernel_size=3, stride=1),
+            #nn.ReLU(),
+            Swish(),
 
-            nn.ReLU(),
+            #ResidualBlockTransConv(32, 32),
             nn.ConvTranspose2d(32, 32, kernel_size=3, stride=1),
-            
+            #nn.ReLU(),
+            Swish(),
+
+            #ResidualBlockTransConv(32, 32),
+            nn.ConvTranspose2d(32, 32, kernel_size=3, stride=1),
             nn.ReLU(),
+            Swish(),
+
+            #ResidualBlockTransConv(32, 32),
             nn.ConvTranspose2d(32, obs_shape[0], kernel_size=3, stride=2, output_padding=1),
         )
 
@@ -239,6 +309,21 @@ class LatentDiscriminator(nn.Module):
         return self.model(z)
     
 
+class LatentDynamicsModel(nn.Module):
+    """z_t+1 = f(z_t, a_t)"""
+    def __init__(self, latent_dim, action_dim):
+        super(LatentDynamicsModel, self).__init__()
+        
+        self.fc = nn.Sequential(
+            nn.Linear(latent_dim + action_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, latent_dim)
+        )
+    
+    def forward(self, z, action):
+        return self.fc(torch.cat([z, action], dim=-1))
+
+
 class cVAE(nn.Module):
     def __init__(self, input_shape=(3, 84, 84), latent_dim=32, context_actions_dim=0, context_rewards_dim=0, freeze_encoder=False):
         super(cVAE, self).__init__()
@@ -246,14 +331,13 @@ class cVAE(nn.Module):
         # Encoder
         self.input_shape = input_shape
         C, H, W = input_shape
-        #self.encoder = ResNetEncoder(obs_shape=input_shape)
         self.encoder = ImageEncoder(obs_shape=input_shape)
         self.flatten = nn.Flatten()
 
         if freeze_encoder:
             print(f"Freezing encoder's parameters (STAGE_2)")
             for param in self.encoder.parameters():
-                if param.requires_grad():
+                if param.requires_grad:
                     param.requires_grad = False
 
         with torch.no_grad():
@@ -266,11 +350,9 @@ class cVAE(nn.Module):
             # Context
             self.actions_encoder = nn.Sequential(
                 nn.Linear(context_actions_dim, 32),
-                #nn.Sigmoid()
             )
             self.rewards_encoder = nn.Sequential(
                 nn.Linear(context_rewards_dim, 32),
-                #nn.Sigmoid()
             )
             out_context_dim = 64 #context_actions_dim + context_rewards_dim #64
             
@@ -280,17 +362,10 @@ class cVAE(nn.Module):
         
         # Decoder
         self.fc_decode = nn.Linear(latent_dim + out_context_dim, encoder_out_dim)
-        # self.mlp_reward = nn.Sequential(
-        #     nn.Linear(latent_dim + out_context_dim, 128),
-        #     nn.ReLU(),
-        #     nn.Linear(128, 32),
-        #     nn.ReLU(),
-        #     nn.Linear(32, 1),
-        # )
         self.decoder = ImageDecoder(obs_shape=input_shape)
 
-    def encode(self, x):
-        encoded = self.encoder(x, flatten=False)  # Shape: [B, encoder_out_dim]
+    def encode(self, x, flatten=True):
+        encoded = self.encoder(x, flatten=flatten)  # Shape: [B, encoder_out_dim]
         return encoded
 
     def sample(self, context_actions, context_rewards):
@@ -303,48 +378,19 @@ class cVAE(nn.Module):
         z = torch.cat([z, z_actions, z_rewards], dim=-1)
         
         decoded = self.fc_decode(z)
-        #reward_pred = self.mlp_reward(z)
         decoded = decoded.view(-1, self.last_enc_layer_shape[1], self.last_enc_layer_shape[2], self.last_enc_layer_shape[3])  # Reshape to match decoder
         reconstructed = self.decoder(decoded)
 
-        return reconstructed#, reward_pred
-    
-    # def predict_reward(self, x, context):
-    #     # Encode
-    #     encoded = self.flatten(self.encoder(x, flatten=False))  # Shape: [B, encoder_out_dim]
-    #     if context is not None:
-    #         encoded = torch.cat([encoded, context], dim=-1)
-        
-    #     mu = self.fc_mu(encoded)
-    #     logvar = self.fc_logvar(encoded)
-        
-    #     # Reparameterization trick
-    #     var = torch.exp(0.5 * logvar)
-    #     eps = torch.randn_like(var)
-    #     z = mu + eps * var
-
-    #     if context is not None:
-    #         z = torch.cat([z, context], dim=-1)
-
-    #     reward_pred = self.mlp_reward(z)
-
-    #     return reward_pred
+        return reconstructed
     
     def forward(self, x, context_actions, context_rewards):
         #batch_size = x.size(0)
         
         # Encode
         encoded = self.flatten(self.encoder(x, flatten=False))  # Shape: [B, encoder_out_dim]
-        #encoded = F.sigmoid(encoded) # experimental
         z_actions = self.actions_encoder(context_actions)
         z_rewards = self.rewards_encoder(context_rewards)
-        # debug
-        #print(f"{encoded.mean()} += {encoded.std()}, {encoded.min()}, {encoded.max()}")
-        #print(f"{z_actions.mean()} += {z_actions.std()}, {z_actions.min()}, {z_actions.max()}")
-        #print(f"{z_rewards.mean()} += {z_rewards.std()}, {z_rewards.min()}, {z_rewards.max()}")
-        # debug
         encoded = torch.cat([encoded, z_actions, z_rewards], dim=-1)
-        #print(f"{encoded.mean()} += {encoded.std()}, {encoded.min()}, {encoded.max()}") # debug
         
         mu = self.fc_mu(encoded)
         logvar = self.fc_logvar(encoded)
@@ -358,10 +404,9 @@ class cVAE(nn.Module):
         z = torch.cat([z, z_actions, z_rewards], dim=-1)
         
         decoded = self.fc_decode(z)
-        #reward_pred = self.mlp_reward(z)
         decoded = decoded.view(-1, self.last_enc_layer_shape[1], self.last_enc_layer_shape[2], self.last_enc_layer_shape[3])  # Reshape to match decoder
         reconstructed = self.decoder(decoded)
-        return reconstructed, mu, logvar, z#, reward_pred
+        return reconstructed, mu, logvar, z
     
 
 # Utils
@@ -439,25 +484,56 @@ def mask_inputs_with_dynamic_regions(inputs, mask, num_frames, mode):
 
 
 # TODO: Validate
-def compute_kl_divergence_on_behaviour_policy(new_policy, pretrained_policy, obs):
+def compute_kl_divergence_on_behaviour_policy(new_policy, pretrained_policy, images_feats, states_feats, std):
     """Compute KL divergence between new and pretrained policies for given states."""
 
-    action_logits_new = new_policy(obs)  # Shape: [batch_size, num_actions]
-    action_logits_pretrained = pretrained_policy(obs).detach()  # Detach to avoid backprop through pretrained
+    new_dist = new_policy(images_feats, std)  # Shape: [batch_size, num_actions]
+    with torch.no_grad():
+        pretrained_dist = pretrained_policy(states_feats, std) # Detach to avoid backprop through pretrained
 
-    probs_new = F.softmax(action_logits_new, dim=-1)  # Shape: [batch_size, num_actions]
-    log_probs_new = F.log_softmax(action_logits_new, dim=-1)
-    log_probs_pretrained = F.log_softmax(action_logits_pretrained, dim=-1)
+    new_samples = new_dist.sample()
+    pretrained_samples = pretrained_dist.sample()
 
-    kl_div = torch.sum(probs_new * (log_probs_new - log_probs_pretrained), dim=-1)
-    kl_div_mean = kl_div.mean()
+    log_probs_new = new_dist.log_prob(new_samples)
+    log_probs_pretrained = pretrained_dist.log_prob(pretrained_samples)
+
+    kl_div = log_probs_new - log_probs_pretrained
+    kl_div_mean = kl_div.mean() 
 
     return kl_div_mean
 
 
 
-def test_states_encoder():
-    raise NotImplementedError
+class PerceptualLoss(nn.Module):
+    def __init__(self):
+        super(PerceptualLoss, self).__init__()
+        vgg = vgg16(pretrained=True).features
+        self.feature_extractor = nn.Sequential(*list(vgg.children())[:9]).eval()
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = False
+        vgg.eval()
+
+    def forward(self, recon, target):
+        # Normalize inputs (VGG expects specific mean/std)
+        recon_norm = normalize(recon, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        target_norm = normalize(target, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # Extract features and compute MSE
+        recon_features = self.feature_extractor(recon_norm)
+        target_features = self.feature_extractor(target_norm)
+        return F.mse_loss(recon_features, target_features)
+
+
+# def test_image_encoders():
+#     obs_shape = (3, 84, 84)
+#     sample = torch.rand((1, obs_shape[0], obs_shape[1], obs_shape[2]))
+
+#     model = ImageEncoder(obs_shape=obs_shape)
+#     encoded = model(sample, flatten=False)
+#     print(f"encoded: {encoded.shape}")
+
+#     model = ResNetEncoder(obs_shape=obs_shape)
+#     encoded = model(sample, flatten=False)
+#     print(f"encoded: {encoded.shape}")
 
 def test_cVAE_parts():
     obs_shape = (3, 84, 84)
@@ -465,10 +541,11 @@ def test_cVAE_parts():
     sample_action = torch.rand((1, 1))
     sample_reward = torch.rand((1, 1))
     model = cVAE(input_shape=obs_shape, context_actions_dim=1, context_rewards_dim=1)
-    reconstructed, mu, logvar = model(sample, sample_action, sample_reward)
+    reconstructed, mu, logvar, z = model(sample, sample_action, sample_reward)
     print(f"reconstructed: {reconstructed.shape}")
     print(f"mu: {mu.shape}")
     print(f"logvar: {logvar.shape}")
+    print(f"z: {z.shape}")
 
 
 if __name__ == "__main__":
