@@ -6,6 +6,8 @@ import utils
 from torchvision.models import resnet18, vgg16
 from torchvision.transforms.functional import normalize
 
+LATENT_ADDITONAL_DIMS = 64
+
 class Swish(nn.Module):
     def __init__(self):
         super(Swish, self).__init__()
@@ -313,11 +315,11 @@ class LatentDynamicsModel(nn.Module):
     """z_t+1 = f(z_t, a_t)"""
     def __init__(self, latent_dim, action_dim):
         super(LatentDynamicsModel, self).__init__()
-        
+
         self.fc = nn.Sequential(
-            nn.Linear(latent_dim + action_dim, 128),
+            nn.Linear(latent_dim + LATENT_ADDITONAL_DIMS + action_dim, 128),
             nn.ReLU(),
-            nn.Linear(128, latent_dim)
+            nn.Linear(128, latent_dim + LATENT_ADDITONAL_DIMS)
         )
     
     def forward(self, z, action):
@@ -354,7 +356,7 @@ class cVAE(nn.Module):
             self.rewards_encoder = nn.Sequential(
                 nn.Linear(context_rewards_dim, 32),
             )
-            out_context_dim = 64 #context_actions_dim + context_rewards_dim #64
+            out_context_dim = LATENT_ADDITONAL_DIMS #context_actions_dim + context_rewards_dim #64
             
             #mu and logvar
             self.fc_mu = nn.Linear(encoder_out_dim + out_context_dim, latent_dim)

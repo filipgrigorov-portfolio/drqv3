@@ -172,9 +172,8 @@ class DrQV2Agent:
         LR_VAE = 1e-3
         self.cVAE_opt = torch.optim.Adam(self.reconstructor.parameters(), lr=LR_VAE) # NOTE (informative)
 
-        #if STAGE_1:
-        #    self.latent_dynamics = LatentDynamicsModel(latent_dim=LATENT_DIM, action_dim=action_shape[0]).to(device)
-        #    self.latent_dynamics_loss = 0.0
+        if STAGE_1:
+           self.latent_dynamics = LatentDynamicsModel(latent_dim=LATENT_DIM, action_dim=action_shape[0]).to(device)
 
         # NOTE (experiment):
         # self.discriminator_latent = LatentDiscriminator(latent_dim=LATENT_DIM).to(device)
@@ -326,7 +325,7 @@ class DrQV2Agent:
         return metrics
 
     
-    def update_reconstruction(self, obs, actions, rewards, step, num_steps):
+    def update_reconstruction(self, obs, next_obs, actions, rewards, step, num_steps):
         """Train the cVAE to reconstruct the input images"""
         metrics = dict()
 
@@ -339,6 +338,7 @@ class DrQV2Agent:
 
 
         obs = obs[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2])
+        next_obs = next_obs[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2])
 
 
 
@@ -376,9 +376,16 @@ class DrQV2Agent:
 
         else:
             obs_reconstructed, mu, logvar, z = self.reconstructor(x=obs, context_actions=actions, context_rewards=rewards)
+            obs_next_reconstructed, mu_next, logvar_next, z_next = self.reconstructor(x=next_obs, context_actions=actions, context_rewards=rewards)
+
+            # NOTE: compute latent dynamics loss
+            z_next_pred = self.latent_dynamics(z, actions)
+            latent_dynamics_loss = F.mse_loss(z_next, z_next_pred)
 
             kl_weight = min(step / num_steps, 1.0)
             reconstruction_loss, recon_loss, kl_loss = compute_reconstruction_loss(reconstructed=obs_reconstructed, original=obs, mu=mu, logvar=logvar, kl_weight=kl_weight)
+
+            reconstruction_loss_dynamic, _, _ = compute_reconstruction_loss(reconstructed=obs_next_reconstructed, original=next_obs, mu=mu_next, logvar=logvar_next, kl_weight=kl_weight)
 
 
         
@@ -411,7 +418,7 @@ class DrQV2Agent:
         if WITH_MASKS:
             total_loss = reconstruction_loss_static + reconstruction_loss_dynamic + ssim_loss
         else:
-            total_loss = reconstruction_loss + 0.3 * ssim_loss# + 0.08 * adv_image_loss
+            total_loss = reconstruction_loss + 0.3 * ssim_loss + 0.3 * latent_dynamics_loss + 0.3 * reconstruction_loss_dynamic # + 0.08 * adv_image_loss
 
 
 
@@ -434,6 +441,7 @@ class DrQV2Agent:
             metrics["cVAE/kl_loss"] = kl_loss.mean().item()
             metrics["cVAE/ssim_loss"] = ssim_loss.mean().item()
             #metrics["cVAE/perceptual_loss"] = perceptual_loss.mean().item()
+            metrics["cVAE/latent_dynamic_loss"] = latent_dynamics_loss.mean().item()
 
             if WITH_MASKS:
                 metrics["cVAE/reconstruction_dynamic_loss"] = reconstruction_loss_dynamic.mean().item()
@@ -587,6 +595,8 @@ class DrQV2Agent:
             # try to select the top reward images
             best_indices = torch.argsort(reward, descending=True, dim=0)[:100]
             high_reward_images = images[best_indices].squeeze(1)
+            high_reward_images_next = next_images[best_indices].squeeze(1)
+
             #sampled_obs = torch.cat([next_images, high_reward_images], dim=0)
             high_rewards = reward[best_indices].squeeze(1)
             high_actions = action[best_indices].squeeze(1)
@@ -606,14 +616,19 @@ class DrQV2Agent:
             actions_norm = high_actions / high_actions.norm(dim=-1, keepdim=True)
             reward_norm = high_rewards / high_rewards.norm(dim=-1, keepdim=True)
             images = high_reward_images
+            next_images = high_reward_images_next
 
-            #TODO: augment??? (shift + noise)
+            #TODO: augment??? (shift + noise) --> THIS WORKS WELL
             #images_aug = self.aug_noise(self.aug(images[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2]).float()))
-            images_aug = self.aug(images[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2]).float())
-            images_aug = images_aug.view(-1, self.flat_image_shape)
-            images = torch.cat([images, images_aug], dim=0)
-            actions_norm = torch.cat([actions_norm, actions_norm], dim=0)
-            reward_norm = torch.cat([reward_norm, reward_norm], dim=0)
+            # images_aug = self.aug(images[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2]).float())
+            # images_aug = images_aug.view(-1, self.flat_image_shape)
+            # images = torch.cat([images, images_aug], dim=0)
+            # actions_norm = torch.cat([actions_norm, actions_norm], dim=0)
+            # reward_norm = torch.cat([reward_norm, reward_norm], dim=0)
+
+
+
+
 
             #TODO: shuffle???
             # shuffled_indices = torch.randperm(actions_norm.size(0))
@@ -626,7 +641,7 @@ class DrQV2Agent:
             #metrics.update(discriminator_metrics)
             
             # NOTE (experiment): Generator step
-            reconstruction_metrics = self.update_reconstruction(obs=images, actions=actions_norm, rewards=reward_norm, step=step, num_steps=num_steps)
+            reconstruction_metrics = self.update_reconstruction(obs=images, next_obs=next_images, actions=actions_norm, rewards=reward_norm, step=step, num_steps=num_steps)
             metrics.update(reconstruction_metrics)
 
                 ###batch = next(replay_iter)
