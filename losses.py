@@ -91,8 +91,8 @@ def relative_mse_loss(reconstructed, target, epsilon=1e-8):
 # Reconstruction Loss and KL Divergence
 def compute_reconstruction_loss(reconstructed, original, mu, logvar, kl_weight=0.01):
     # Reconstruction loss (pixel-wise MSE)
-    #recon_loss = F.mse_loss(reconstructed, original, reduction='mean')
-    recon_loss = relative_mse_loss(reconstructed, original)
+    recon_loss = F.mse_loss(reconstructed, original, reduction='mean')
+    #recon_loss = relative_mse_loss(reconstructed, original)
     
     # KL Divergence loss
     kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / original.size(0)

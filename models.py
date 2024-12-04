@@ -8,6 +8,7 @@ from torchvision.transforms.functional import normalize
 
 LATENT_ADDITONAL_DIMS = 64
 
+
 class Swish(nn.Module):
     def __init__(self):
         super(Swish, self).__init__()
@@ -80,22 +81,22 @@ class ImageEncoder(nn.Module):
 
         self.convnet = nn.Sequential(
             nn.Conv2d(obs_shape[0], 32, 3, stride=2),
-            #ResidualBlock(32, 32),
+            ResidualBlock(32, 32),
             #nn.ReLU(), 
             Swish(),
             
             nn.Conv2d(32, 32, 3, stride=1),
-            #ResidualBlock(32, 32),
+            ResidualBlock(32, 32),
             #nn.ReLU(),
             Swish(), 
             
             nn.Conv2d(32, 32, 3, stride=1),
-            #ResidualBlock(32, 32),
+            ResidualBlock(32, 32),
             #nn.ReLU(), 
             Swish(),
             
             nn.Conv2d(32, 32, 3, stride=1),
-            #ResidualBlock(32, 32),
+            ResidualBlock(32, 32),
         )
 
         self.apply(utils.weight_init)
@@ -356,14 +357,14 @@ class cVAE(nn.Module):
             self.rewards_encoder = nn.Sequential(
                 nn.Linear(context_rewards_dim, 32),
             )
-            out_context_dim = LATENT_ADDITONAL_DIMS #context_actions_dim + context_rewards_dim #64
+            out_context_dim = 0 #LATENT_ADDITONAL_DIMS #context_actions_dim + context_rewards_dim #64
             
             #mu and logvar
             self.fc_mu = nn.Linear(encoder_out_dim + out_context_dim, latent_dim)
             self.fc_logvar = nn.Linear(encoder_out_dim + out_context_dim, latent_dim)
         
         # Decoder
-        self.fc_decode = nn.Linear(latent_dim + out_context_dim, encoder_out_dim)
+        self.fc_decode = nn.Linear(latent_dim + LATENT_ADDITONAL_DIMS, encoder_out_dim)
         self.decoder = ImageDecoder(obs_shape=input_shape)
 
     def encode(self, x, flatten=True):
@@ -392,7 +393,7 @@ class cVAE(nn.Module):
         encoded = self.flatten(self.encoder(x, flatten=False))  # Shape: [B, encoder_out_dim]
         z_actions = self.actions_encoder(context_actions)
         z_rewards = self.rewards_encoder(context_rewards)
-        encoded = torch.cat([encoded, z_actions, z_rewards], dim=-1)
+        #encoded = torch.cat([encoded, z_actions, z_rewards], dim=-1)
         
         mu = self.fc_mu(encoded)
         logvar = self.fc_logvar(encoded)

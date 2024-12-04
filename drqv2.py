@@ -21,8 +21,8 @@ import io
 from PIL import Image
 
 # TODO: Place in cli args
-STAGE_1 = True
-STAGE_2 = False
+STAGE_1 = False
+STAGE_2 = True
 
 LOG_EVERY = 20000
 NUM_ACC_STEPS = 1000
@@ -140,16 +140,16 @@ class DrQV2Agent:
         if STAGE_2:
             print(f"Loading pretrained actor weights at actor_weights.pth")
             self.pretrained_actor = Actor(self.reconstructor.encoder.repr_dim, action_shape, feature_dim, hidden_dim).to(device)
-            self.pretrained_actor.load_state_dict(torch.load("/home/filip-grigorov/workspace/repos/research/drqv2/actor_weights.pth", weights_only=True))
+            self.pretrained_actor.load_state_dict(torch.load("/home/filip/workspace/repos/research/drqv2/actor_weights.pth", weights_only=True))
             self.pretrained_actor.eval()
 
             print(f"Loading pretrained state encoder weights at state_encoder_weights.pth")
             self.state_encoder = StateEncoder(state_shape).to(device)
-            self.state_encoder.load_state_dict(torch.load("/home/filip-grigorov/workspace/repos/research/drqv2/state_encoder_weights.pth", weights_only=True))
+            self.state_encoder.load_state_dict(torch.load("/home/filip/workspace/repos/research/drqv2/state_encoder_weights.pth", weights_only=True))
             self.state_encoder.eval()
 
             print(f"Loading pretrained cVAE weights at cVAE_weights.pth")
-            self.reconstructor.load_state_dict(torch.load("/home/filip-grigorov/workspace/repos/research/drqv2/cVAE_weights.pth", weights_only=True))
+            self.reconstructor.load_state_dict(torch.load("//home/filip/workspace/repos/research/drqv2/cVAE_weights.pth", weights_only=True))
             #self.reconstructor.eval() # This could train some more or not
             
 
@@ -169,7 +169,7 @@ class DrQV2Agent:
             {"params": self.critic.parameters(), "lr": lr},
             {"params": self.state_encoder.parameters(), "lr": lr}
         ])
-        LR_VAE = 1e-3
+        LR_VAE = lr #1e-3
         self.cVAE_opt = torch.optim.Adam(self.reconstructor.parameters(), lr=LR_VAE) # NOTE (informative)
 
         if STAGE_1:
@@ -267,7 +267,7 @@ class DrQV2Agent:
             actor_kl_reg = compute_kl_divergence_on_behaviour_policy(self.actor, self.pretrained_actor, images_feats=obs[:B, ...], states_feats=states_feats, std=stddev)
             if self.use_tb:
                 metrics['actor_kl_reg'] = actor_kl_reg.item()
-            actor_loss = actor_loss + 0.1 * actor_kl_reg
+            actor_loss = actor_loss + actor_kl_reg
 
         # NOTE (informative): optimize actor
         self.actor_opt.zero_grad(set_to_none=True)
@@ -376,16 +376,17 @@ class DrQV2Agent:
 
         else:
             obs_reconstructed, mu, logvar, z = self.reconstructor(x=obs, context_actions=actions, context_rewards=rewards)
-            obs_next_reconstructed, mu_next, logvar_next, z_next = self.reconstructor(x=next_obs, context_actions=actions, context_rewards=rewards)
+            _, _, _, z_next = self.reconstructor(x=next_obs, context_actions=actions, context_rewards=rewards)
 
+            if STAGE_1:
             # NOTE: compute latent dynamics loss
-            z_next_pred = self.latent_dynamics(z, actions)
-            latent_dynamics_loss = F.mse_loss(z_next, z_next_pred)
+                z_next_pred = self.latent_dynamics(z, actions)
+                latent_dynamics_loss = F.mse_loss(z_next, z_next_pred)
 
             kl_weight = min(step / num_steps, 1.0)
             reconstruction_loss, recon_loss, kl_loss = compute_reconstruction_loss(reconstructed=obs_reconstructed, original=obs, mu=mu, logvar=logvar, kl_weight=kl_weight)
 
-            reconstruction_loss_dynamic, _, _ = compute_reconstruction_loss(reconstructed=obs_next_reconstructed, original=next_obs, mu=mu_next, logvar=logvar_next, kl_weight=kl_weight)
+            #reconstruction_loss_dynamic, _, _ = compute_reconstruction_loss(reconstructed=obs_next_reconstructed, original=next_obs, mu=mu_next, logvar=logvar_next, kl_weight=kl_weight)
 
 
         
@@ -418,7 +419,10 @@ class DrQV2Agent:
         if WITH_MASKS:
             total_loss = reconstruction_loss_static + reconstruction_loss_dynamic + ssim_loss
         else:
-            total_loss = reconstruction_loss + 0.3 * ssim_loss + 0.3 * latent_dynamics_loss + 0.3 * reconstruction_loss_dynamic # + 0.08 * adv_image_loss
+            if STAGE_1:
+                total_loss = 0.1 * reconstruction_loss + ssim_loss + 0.5 * latent_dynamics_loss # + 0.08 * adv_image_loss
+            else:
+                total_loss = 0.1 * reconstruction_loss + ssim_loss
 
 
 
@@ -441,7 +445,8 @@ class DrQV2Agent:
             metrics["cVAE/kl_loss"] = kl_loss.mean().item()
             metrics["cVAE/ssim_loss"] = ssim_loss.mean().item()
             #metrics["cVAE/perceptual_loss"] = perceptual_loss.mean().item()
-            metrics["cVAE/latent_dynamic_loss"] = latent_dynamics_loss.mean().item()
+            if STAGE_1:
+                metrics["cVAE/latent_dynamic_loss"] = latent_dynamics_loss.mean().item()
 
             if WITH_MASKS:
                 metrics["cVAE/reconstruction_dynamic_loss"] = reconstruction_loss_dynamic.mean().item()
@@ -542,7 +547,9 @@ class DrQV2Agent:
             reward_norm = reward / reward.norm(dim=-1, keepdim=True)
             sampled_obs = self.reconstructor.sample(context_actions=actions_norm, context_rewards=reward_norm)
             # The actions and rewards are more or less similar for immediate next state
+            # TODO: Use latent dynamics to decode the next obs
             sampled_next_obs = self.reconstructor.sample(context_actions=actions_norm, context_rewards=reward_norm)
+
             B = images.size(0) // 2
             images = torch.cat([images, sampled_obs], dim=0)
             next_images = torch.cat([next_images, sampled_next_obs], dim=0)
@@ -552,6 +559,10 @@ class DrQV2Agent:
             metrics["cVAE/sampled_images1"] = sampled_obs[:3, :3, ...]
             metrics["cVAE/sampled_images2"] = sampled_obs[:3, 3:6, ...]
             metrics["cVAE/sampled_images3"] = sampled_obs[:3, 6:9, ...]
+
+            metrics["cVAE/sampled_next_images1"] = sampled_next_obs[:3, :3, ...]
+            metrics["cVAE/sampled_next_images2"] = sampled_next_obs[:3, 3:6, ...]
+            metrics["cVAE/sampled_next_images3"] = sampled_next_obs[:3, 6:9, ...]
 
             with torch.no_grad():
                 obs = self.reconstructor.encode(images)
@@ -652,8 +663,9 @@ class DrQV2Agent:
 
         elif STAGE_2:
             # might not be turned on
-            reconstruction_metrics = self.update_reconstruction(images, action, reward, step, num_steps)
+            reconstruction_metrics = self.update_reconstruction(obs=images, next_obs=next_images, actions=action, rewards=reward, step=step, num_steps=num_steps)
             metrics.update(reconstruction_metrics)
+            pass
 
 
 
