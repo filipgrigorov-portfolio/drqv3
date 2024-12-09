@@ -16,7 +16,6 @@ from dm_env import StepType, specs
 STAGE_1 = True
 STAGE_2 = False
 
-
 class ExtendedTimeStep(NamedTuple):
     step_type: Any
     reward: Any
@@ -140,7 +139,18 @@ class FrameStackAndStatesWrapper(dm_env.Environment):
         self._pixels_key = pixels_keys[-1]
         assert self._pixels_key in wrapped_obs_spec
 
-        states_shape = np.sum([ wrapped_obs_spec[pixels_keys[i]].shape for i in range(len(pixels_keys) - 1) ], axis=0)[0]
+        for i in range(len(pixels_keys) - 1):
+            print(wrapped_obs_spec[pixels_keys[i]].shape)
+
+        states_shape = []
+        for i in range(len(pixels_keys) - 1):
+            given_shape = wrapped_obs_spec[pixels_keys[i]].shape
+            if not given_shape:
+                states_shape.append([1])
+            else:
+                states_shape.append(given_shape)
+        #states_shape = np.sum([ wrapped_obs_spec[pixels_keys[i]].shape for i in range(len(pixels_keys) - 1) ], axis=0)[0]
+        states_shape = np.sum(states_shape, axis=0)[0]
         pixels_shape = wrapped_obs_spec[pixels_keys[-1]].shape
         # remove batch dim
         if len(pixels_shape) == 4:
@@ -172,7 +182,15 @@ class FrameStackAndStatesWrapper(dm_env.Environment):
         return pixels.transpose(2, 0, 1).copy()
     
     def _extract_states(self, time_step):
-        states = np.concatenate([ time_step.observation[self._pixels_keys[i]] for i in range(len(self._pixels_keys)-1) ])
+        states = []
+        for i in range(len(self._pixels_keys) - 1):
+            state = time_step.observation[self._pixels_keys[i]]
+            if not isinstance(state, np.ndarray):
+                states.append([state])
+                continue
+            states.append(state)
+        #tates = np.concatenate([ time_step.observation[self._pixels_keys[i]] for i in range(len(self._pixels_keys)-1) ])
+        states = np.concatenate(states)
         return states.astype(np.float32)
 
     def reset(self):
@@ -289,7 +307,9 @@ def make(name, frame_stack, action_repeat, seed):
                              render_kwargs=render_kwargs)
     # stack several frames
     if STAGE_1:
-        env = FrameStackAndStatesWrapper(env, frame_stack)
+        # cartpole_balance: ['position', 'velocity', 'pixels']
+        # walker_run: ['orientations', 'height', 'velocity',  'pixels']
+        env = FrameStackAndStatesWrapper(env, frame_stack, pixels_keys=['position', 'velocity', 'pixels'])
     elif STAGE_2:
         env = FrameStackWrapper(env, frame_stack, pixels_key)
     else:

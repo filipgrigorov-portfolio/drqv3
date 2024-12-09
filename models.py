@@ -135,22 +135,22 @@ class ImageDecoder(nn.Module):
         self.repr_dim = 32 * 35 * 35
 
         self.convnet = nn.Sequential(
-            #ResidualBlockTransConv(32, 32),
+            ResidualBlockTransConv(32, 32),
             nn.ConvTranspose2d(32, 32, kernel_size=3, stride=1),
             #nn.ReLU(),
             Swish(),
 
-            #ResidualBlockTransConv(32, 32),
+            ResidualBlockTransConv(32, 32),
             nn.ConvTranspose2d(32, 32, kernel_size=3, stride=1),
             #nn.ReLU(),
             Swish(),
 
-            #ResidualBlockTransConv(32, 32),
+            ResidualBlockTransConv(32, 32),
             nn.ConvTranspose2d(32, 32, kernel_size=3, stride=1),
             nn.ReLU(),
             Swish(),
 
-            #ResidualBlockTransConv(32, 32),
+            ResidualBlockTransConv(32, 32),
             nn.ConvTranspose2d(32, obs_shape[0], kernel_size=3, stride=2, output_padding=1),
         )
 
@@ -168,12 +168,15 @@ class StateEncoder(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(in_features=obs_shape, out_features=16),
             nn.ReLU(),
+            #Swish(),
 
             nn.Linear(in_features=16, out_features=32),
             nn.ReLU(),
+            #Swish(),
 
             nn.Linear(in_features=32, out_features=self.repr_dim),
             nn.ReLU(),
+            #Swish(),
         )
 
     def forward(self, x):
@@ -317,15 +320,53 @@ class LatentDynamicsModel(nn.Module):
     def __init__(self, latent_dim, action_dim):
         super(LatentDynamicsModel, self).__init__()
 
+        # new
+        self.action_mlp = nn.Sequential(    
+            nn.Linear(action_dim, LATENT_ADDITONAL_DIMS),
+        )
+
+        input_dim = latent_dim + 2 * LATENT_ADDITONAL_DIMS
+        #input_dim = latent_dim + LATENT_ADDITONAL_DIMS + action_dim
         self.fc = nn.Sequential(
-            nn.Linear(latent_dim + LATENT_ADDITONAL_DIMS + action_dim, 128),
-            nn.ReLU(),
+            nn.Linear(input_dim, 128),
+            #nn.ReLU(),
+            Swish(),
             nn.Linear(128, latent_dim + LATENT_ADDITONAL_DIMS)
         )
     
     def forward(self, z, action):
-        return self.fc(torch.cat([z, action], dim=-1))
+        action = self.action_mlp(action)
+        z = torch.cat([z, action], dim=-1)
+        return self.fc(z)
 
+class EncoderTransformer(nn.Module):
+    def __init__(self, latent_dim, encoder_dim):
+        super().__init__()
+
+        self.map_in = nn.Linear(encoder_dim, latent_dim)
+        NUM_HEADS = 4
+        NUM_LAYERS = 2
+        self.positional_encoding = nn.Parameter(torch.zeros(1, latent_dim))  # Adjust based on feature size
+        self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(latent_dim, NUM_HEADS, batch_first=True), num_layers=NUM_LAYERS)
+        self.map_out = nn.Linear(latent_dim, encoder_dim)
+
+    def forward(self, x):
+        x = self.map_in(x)
+        x += self.positional_encoding
+        x = self.transformer(x)
+        x = self.map_out(x)
+        return x
+    
+class DecoderTransformer(nn.Module):
+    def __init__(self, latent_dim):
+        super().__init__()
+
+        NUM_HEADS = 4
+        NUM_LAYERS = 2
+        self.transformer = nn.TransformerDecoder(nn.TransformerDecoderLayer(latent_dim, NUM_HEADS, batch_first=True), num_layers=NUM_LAYERS)
+
+    def forward(self, x, memory):
+        return self.transformer(x, memory)
 
 class cVAE(nn.Module):
     def __init__(self, input_shape=(3, 84, 84), latent_dim=32, context_actions_dim=0, context_rewards_dim=0, freeze_encoder=False):
@@ -352,19 +393,26 @@ class cVAE(nn.Module):
             
             # Context
             self.actions_encoder = nn.Sequential(
-                nn.Linear(context_actions_dim, 32),
+                nn.Linear(context_actions_dim, 64), # experiment 32 -> 64
             )
             self.rewards_encoder = nn.Sequential(
-                nn.Linear(context_rewards_dim, 32),
+                nn.Linear(context_rewards_dim, 64), # experiment 32 -> 64
             )
-            out_context_dim = 0 #LATENT_ADDITONAL_DIMS #context_actions_dim + context_rewards_dim #64
+        
             
+            # TRANSFORMER
+            self.encoder_transformer = EncoderTransformer(latent_dim, encoder_out_dim) # experiment
+            self.decoder_transformer = DecoderTransformer(latent_dim) # experiment
+
+
             #mu and logvar
+            out_context_dim = 0 #LATENT_ADDITONAL_DIMS #context_actions_dim + context_rewards_dim #64
             self.fc_mu = nn.Linear(encoder_out_dim + out_context_dim, latent_dim)
             self.fc_logvar = nn.Linear(encoder_out_dim + out_context_dim, latent_dim)
         
         # Decoder
-        self.fc_decode = nn.Linear(latent_dim + LATENT_ADDITONAL_DIMS, encoder_out_dim)
+        #self.fc_decode = nn.Linear(latent_dim + LATENT_ADDITONAL_DIMS, encoder_out_dim)
+        self.fc_decode = nn.Linear(latent_dim, encoder_out_dim) # experiment
         self.decoder = ImageDecoder(obs_shape=input_shape)
 
     def encode(self, x, flatten=True):
@@ -372,19 +420,25 @@ class cVAE(nn.Module):
         return encoded
 
     def sample(self, context_actions, context_rewards):
-        # Decode
-        B = context_actions.size(0)
-        z = torch.randn(B, self.fc_mu.out_features).to(context_actions.device)
+        with torch.no_grad():
+            # Decode
+            B = context_actions.size(0)
+            z = torch.randn(B, self.fc_mu.out_features).to(context_actions.device)
+            
 
-        z_actions = self.actions_encoder(context_actions)
-        z_rewards = self.rewards_encoder(context_rewards)
-        z = torch.cat([z, z_actions, z_rewards], dim=-1)
-        
-        decoded = self.fc_decode(z)
-        decoded = decoded.view(-1, self.last_enc_layer_shape[1], self.last_enc_layer_shape[2], self.last_enc_layer_shape[3])  # Reshape to match decoder
-        reconstructed = self.decoder(decoded)
+            z_actions = self.actions_encoder(context_actions)
+            z_rewards = self.rewards_encoder(context_rewards)
+            
 
-        return reconstructed
+            z_transformer = self.decoder_transformer(z, torch.cat([z_actions, z_rewards], dim=-1)) # experiment
+
+
+            z = torch.cat([z, z_actions, z_rewards], dim=-1)
+            decoded = self.fc_decode(z_transformer)
+            decoded = decoded.view(-1, self.last_enc_layer_shape[1], self.last_enc_layer_shape[2], self.last_enc_layer_shape[3])  # Reshape to match decoder
+            reconstructed = self.decoder(decoded)
+
+            return reconstructed
     
     def forward(self, x, context_actions, context_rewards):
         #batch_size = x.size(0)
@@ -395,6 +449,8 @@ class cVAE(nn.Module):
         z_rewards = self.rewards_encoder(context_rewards)
         #encoded = torch.cat([encoded, z_actions, z_rewards], dim=-1)
         
+        encoded = self.encoder_transformer(encoded) # experiment
+
         mu = self.fc_mu(encoded)
         logvar = self.fc_logvar(encoded)
         
@@ -404,9 +460,12 @@ class cVAE(nn.Module):
         z = mu + eps * var
         
         # Decode
-        z = torch.cat([z, z_actions, z_rewards], dim=-1)
         
-        decoded = self.fc_decode(z)
+        z_transformer = self.decoder_transformer(z, torch.cat([z_actions, z_rewards], dim=-1)) # experiment
+
+
+        z = torch.cat([z, z_actions, z_rewards], dim=-1)
+        decoded = self.fc_decode(z_transformer)
         decoded = decoded.view(-1, self.last_enc_layer_shape[1], self.last_enc_layer_shape[2], self.last_enc_layer_shape[3])  # Reshape to match decoder
         reconstructed = self.decoder(decoded)
         return reconstructed, mu, logvar, z

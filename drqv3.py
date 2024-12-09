@@ -35,6 +35,20 @@ PLOT_LATENT = False
 WITH_MASKS = False
 WITH_DYNAMIC_MASK_ONLY = False
 
+# Training regime flags
+# Stage 1
+HIGH_REWARD = False
+AUGMENT = False
+LATENT_DYNAMICS = False
+WITH_RECONSTRUCTION = True
+
+# Stage 2
+TRAIN_STAGE_2 = True
+REGULARIZE_ACTOR = True
+SHUFFLE = True
+
+print(f"Training flags: STAGE_1={STAGE_1}, STAGE_2={STAGE_2}, HIGH_REWARD={HIGH_REWARD}, AUGMENT={AUGMENT}, TRAIN_STAGE_2={TRAIN_STAGE_2}, LATENT_DYNAMICS={LATENT_DYNAMICS}, REGULARIZE_ACTOR={REGULARIZE_ACTOR}, SHUFFLE={SHUFFLE}, WITH_RECONSTRUCTION={WITH_RECONSTRUCTION}, WITH_MASKS={WITH_MASKS}, WITH_RECONSTRUCTION={WITH_RECONSTRUCTION}")
+
 class RandomShiftsAug(nn.Module):
     def __init__(self, pad):
         super().__init__()
@@ -63,10 +77,7 @@ class RandomShiftsAug(nn.Module):
         shift *= 2.0 / (h + 2 * self.pad)
 
         grid = base_grid + shift
-        return F.grid_sample(x,
-                             grid,
-                             padding_mode='zeros',
-                             align_corners=False)
+        return F.grid_sample(x, grid,padding_mode='zeros', align_corners=False)
 
 class NoiseAugmentation(nn.Module):
     def __init__(self, noise_type='gaussian', noise_level=0.1):
@@ -96,7 +107,7 @@ class NoiseAugmentation(nn.Module):
             raise ValueError("Unsupported noise type")
 
 
-class DrQV2Agent:
+class DrQV3Agent:
     def __init__(self, obs_shape, action_shape, device, lr, feature_dim,
                  hidden_dim, critic_target_tau, num_expl_steps,
                  update_every_steps, stddev_schedule, stddev_clip, use_tb):
@@ -138,19 +149,29 @@ class DrQV2Agent:
         self.prev_actor_loss = 1e10
         self.prev_reconstruction_loss = 1e10
         if STAGE_2:
+            self.image_encoder = ImageEncoder(obs_shape=self.image_shape).to(device)
+            self.image_encoder.train()
+            self.image_encoder.apply(utils.weight_init)
+
             print(f"Loading pretrained actor weights at actor_weights.pth")
             self.pretrained_actor = Actor(self.reconstructor.encoder.repr_dim, action_shape, feature_dim, hidden_dim).to(device)
             self.pretrained_actor.load_state_dict(torch.load("/home/filip/workspace/repos/research/drqv2/actor_weights.pth", weights_only=True))
             self.pretrained_actor.eval()
 
-            print(f"Loading pretrained state encoder weights at state_encoder_weights.pth")
-            self.state_encoder = StateEncoder(state_shape).to(device)
-            self.state_encoder.load_state_dict(torch.load("/home/filip/workspace/repos/research/drqv2/state_encoder_weights.pth", weights_only=True))
-            self.state_encoder.eval()
+            utils.freeze_model(self.pretrained_actor)
+
+            if REGULARIZE_ACTOR:
+                print(f"Loading pretrained state encoder weights at state_encoder_weights.pth")
+                self.state_encoder = StateEncoder(state_shape).to(device)
+                self.state_encoder.load_state_dict(torch.load("/home/filip/workspace/repos/research/drqv2/state_encoder_weights.pth", weights_only=True))
+                self.state_encoder.eval()
+                utils.freeze_model(self.state_encoder)
 
             print(f"Loading pretrained cVAE weights at cVAE_weights.pth")
             self.reconstructor.load_state_dict(torch.load("//home/filip/workspace/repos/research/drqv2/cVAE_weights.pth", weights_only=True))
             #self.reconstructor.eval() # This could train some more or not
+            # NOTE: We freeze the encoder of the cVAE and, possibly, fine-tune the decoder only
+            utils.freeze_model(self.reconstructor.encoder)
             
 
         # Critic policy
@@ -165,14 +186,24 @@ class DrQV2Agent:
 
         # NOTE (informative): optimizers
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic_opt = torch.optim.Adam([
-            {"params": self.critic.parameters(), "lr": lr},
-            {"params": self.state_encoder.parameters(), "lr": lr}
-        ])
+
+        if STAGE_1:
+            print(f"Optimizing the state encoder along with the critic in STAGE 1")
+            self.critic_opt = torch.optim.Adam([
+                {"params": self.critic.parameters(), "lr": lr},
+                {"params": self.state_encoder.parameters(), "lr": lr}
+            ])
+        else:
+            print(f"Optimizing the image encoder along with the critic in STAGE 2")
+            self.critic_opt = torch.optim.Adam([
+                {"params": self.critic.parameters(), "lr": lr},
+                {"params": self.image_encoder.parameters(), "lr": lr}
+            ])
+
         LR_VAE = lr #1e-3
         self.cVAE_opt = torch.optim.Adam(self.reconstructor.parameters(), lr=LR_VAE) # NOTE (informative)
 
-        if STAGE_1:
+        if STAGE_1 and LATENT_DYNAMICS:
            self.latent_dynamics = LatentDynamicsModel(latent_dim=LATENT_DIM, action_dim=action_shape[0]).to(device)
 
         # NOTE (experiment):
@@ -203,7 +234,8 @@ class DrQV2Agent:
             obs = self.state_encoder(obs)    # STATES ENCODING 
         elif STAGE_2:
             obs = obs[:self.flat_image_shape].view(self.image_shape[0], self.image_shape[1], self.image_shape[2])
-            obs = self.reconstructor.encode(obs.unsqueeze(0), flatten=True) # IMG ENCODING
+            #obs = self.reconstructor.encode(obs.unsqueeze(0), flatten=True) # IMG ENCODING
+            obs = self.image_encoder(obs.unsqueeze(0), flatten=True) # IMG ENCODING
         else:
             raise("Just STAGE_1 and STAGE_2")
 
@@ -262,7 +294,7 @@ class DrQV2Agent:
 
         actor_loss = -Q.mean() # max the prob(a) to max Q for said action
 
-        if STAGE_2:
+        if STAGE_2 and REGULARIZE_ACTOR:
             B = obs.size(0) // 2
             actor_kl_reg = compute_kl_divergence_on_behaviour_policy(self.actor, self.pretrained_actor, images_feats=obs[:B, ...], states_feats=states_feats, std=stddev)
             if self.use_tb:
@@ -275,14 +307,15 @@ class DrQV2Agent:
         self.actor_opt.step()
 
         # NOTE (Save for stage 2)
-        if actor_loss.item() < self.prev_actor_loss:
-            #print(f"Saving actor weights at actor_weights.pth")
-            torch.save(self.actor.state_dict(), "actor_weights.pth")
+        # if actor_loss.item() < self.prev_actor_loss:
+        #     #print(f"Saving actor weights at actor_weights.pth")
+        #     torch.save(self.actor.state_dict(), f"actor_weights.pth")
 
-            #print(f"Saving actor weights at state_encoder_weights.pth")
-            torch.save(self.state_encoder.state_dict(), "state_encoder_weights.pth")
+        #     if STAGE_1:
+        #         #print(f"Saving actor weights at state_encoder_weights.pth")
+        #         torch.save(self.state_encoder.state_dict(), f"state_encoder_weights.pth")
             
-            self.prev_actor_loss = actor_loss.item()
+        #    self.prev_actor_loss = actor_loss.item()
 
         if self.use_tb:
             metrics['actor_loss'] = actor_loss.item()
@@ -376,10 +409,11 @@ class DrQV2Agent:
 
         else:
             obs_reconstructed, mu, logvar, z = self.reconstructor(x=obs, context_actions=actions, context_rewards=rewards)
-            _, _, _, z_next = self.reconstructor(x=next_obs, context_actions=actions, context_rewards=rewards)
 
-            if STAGE_1:
-            # NOTE: compute latent dynamics loss
+            if STAGE_1 and LATENT_DYNAMICS:
+                _, _, _, z_next = self.reconstructor(x=next_obs, context_actions=actions, context_rewards=rewards)
+
+                # NOTE: compute latent dynamics loss
                 z_next_pred = self.latent_dynamics(z, actions)
                 latent_dynamics_loss = F.mse_loss(z_next, z_next_pred)
 
@@ -420,7 +454,7 @@ class DrQV2Agent:
             total_loss = reconstruction_loss_static + reconstruction_loss_dynamic + ssim_loss
         else:
             if STAGE_1:
-                total_loss = 0.1 * reconstruction_loss + ssim_loss + 0.5 * latent_dynamics_loss # + 0.08 * adv_image_loss
+                total_loss = 0.1 * reconstruction_loss + ssim_loss + 0.5 * (latent_dynamics_loss if LATENT_DYNAMICS else 0.0) # + 0.08 * adv_image_loss
             else:
                 total_loss = 0.1 * reconstruction_loss + ssim_loss
 
@@ -431,10 +465,10 @@ class DrQV2Agent:
         self.cVAE_opt.step()
 
 
-        if total_loss < self.prev_reconstruction_loss:
+        #if total_loss < self.prev_reconstruction_loss:
             #print(f"Saving cVAE weights at cVAE_weights.pth")
-            torch.save(self.reconstructor.state_dict(), "cVAE_weights.pth")
-            self.prev_reconstruction_loss = total_loss.item()
+            #torch.save(self.reconstructor.state_dict(), f"cVAE_weights.pth")
+            #self.prev_reconstruction_loss = total_loss.item()
 
 
         if self.use_tb:
@@ -445,7 +479,7 @@ class DrQV2Agent:
             metrics["cVAE/kl_loss"] = kl_loss.mean().item()
             metrics["cVAE/ssim_loss"] = ssim_loss.mean().item()
             #metrics["cVAE/perceptual_loss"] = perceptual_loss.mean().item()
-            if STAGE_1:
+            if STAGE_1 and LATENT_DYNAMICS:
                 metrics["cVAE/latent_dynamic_loss"] = latent_dynamics_loss.mean().item()
 
             if WITH_MASKS:
@@ -511,6 +545,74 @@ class DrQV2Agent:
                     metrics["cVAE/latent_space"] = image_array
 
         return metrics
+    
+    def update_decoder(self, obs, next_obs, actions, rewards, step, num_steps):
+        """Train the cVAE decoder to reconstruct the input images"""
+        metrics = dict()
+
+        obs = obs[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2])
+        next_obs = next_obs[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2])
+
+        obs_reconstructed, mu, logvar, _ = self.reconstructor(x=obs, context_actions=actions, context_rewards=rewards)
+        kl_weight = min(step / num_steps, 1.0)
+        reconstruction_loss, recon_loss, kl_loss = compute_reconstruction_loss(reconstructed=obs_reconstructed, original=obs, mu=mu, logvar=logvar, kl_weight=kl_weight)
+
+        
+        # SSIM loss
+        ssim_loss = 0.0
+        #perceptual_loss = 0.0
+        for i in range(0, obs.shape[1] // 3):
+            ssim_loss += self.ssim_loss_fn(obs_reconstructed[:, i*3:(i+1)*3, ...], obs[:, i*3:(i+1)*3, ...])
+            #with torch.no_grad():
+            #    perceptual_loss += self.perception_loss(obs_reconstructed[:, i*3:(i+1)*3, ...], obs[:, i*3:(i+1)*3, ...])
+
+        if WITH_MASKS:
+            ssim_loss /= (obs.shape[1] * 2)
+        else:
+            ssim_loss /= obs.shape[1]
+            #perceptual_loss /= obs.shape[1]
+
+
+        total_loss = reconstruction_loss + ssim_loss
+
+
+
+        self.cVAE_opt.zero_grad()
+        total_loss.backward()
+        self.cVAE_opt.step()
+
+
+        #if total_loss < self.prev_reconstruction_loss:
+            #print(f"Saving cVAE weights at cVAE_weights.pth")
+            #torch.save(self.reconstructor.state_dict(), f"cVAE_decoder_weights.pth")
+            #self.prev_reconstruction_loss = total_loss.item()
+
+
+        if self.use_tb:
+            variance = torch.exp(0.5 * logvar)
+
+            metrics["cVAE/recon_loss"] = recon_loss.mean().item()
+            metrics["cVAE/kl_loss"] = kl_loss.mean().item()
+            metrics["cVAE/ssim_loss"] = ssim_loss.mean().item()
+            #metrics["cVAE/perceptual_loss"] = perceptual_loss.mean().item()
+
+            metrics["cVAE/reconstruction_loss"] = reconstruction_loss.mean().item()
+
+            metrics["cVAE/distribution_mean"] = mu.mean().item()
+            metrics["cVAE/distribution_variance"] = variance.mean().item()
+            metrics["cVAE/total_loss"] = total_loss.item()
+
+            if step == 2000 or step % LOG_EVERY == 0:
+                metrics["cVAE/original_images1"] = obs[:3, :3, ...]
+                metrics["cVAE/decoder_reconstructed_images1"] = obs_reconstructed[:3, :3, ...]
+
+                metrics["cVAE/original_images2"] = obs[:3, 3:6, ...]
+                metrics["cVAE/decoder_reconstructed_images2"] = obs_reconstructed[:3, 3:6, ...]
+
+                metrics["cVAE/original_images3"] = obs[:3, 6:9, ...]
+                metrics["cVAE/decoder_reconstructed_images3"] = obs_reconstructed[:3, 6:9, ...]
+
+        return metrics
 
     def update(self, replay_iter, step, num_steps):
         metrics = dict()
@@ -531,10 +633,10 @@ class DrQV2Agent:
             states = obs[:, self.flat_image_shape:]
             images = obs[:, :self.flat_image_shape]
             obs = self.state_encoder(states)
-            with torch.no_grad():
-                next_states = next_obs[:, self.flat_image_shape:]
-                next_images = next_obs[:, :self.flat_image_shape]
-                next_obs = self.state_encoder(next_states)
+            
+            next_states = next_obs[:, self.flat_image_shape:]
+            next_images = next_obs[:, :self.flat_image_shape]
+            next_obs = self.state_encoder(next_states)
 
         # NOTE: This serves as the sampled augmented entries to update the policies instead of detreminitically augmenting the observations --- Address
         elif STAGE_2:
@@ -550,27 +652,35 @@ class DrQV2Agent:
             # TODO: Use latent dynamics to decode the next obs
             sampled_next_obs = self.reconstructor.sample(context_actions=actions_norm, context_rewards=reward_norm)
 
-            B = images.size(0) // 2
             images = torch.cat([images, sampled_obs], dim=0)
             next_images = torch.cat([next_images, sampled_next_obs], dim=0)
             reward_norm = torch.tile(reward_norm, (2, 1))
             actions_norm = torch.tile(actions_norm, (2, 1))
             
-            metrics["cVAE/sampled_images1"] = sampled_obs[:3, :3, ...]
-            metrics["cVAE/sampled_images2"] = sampled_obs[:3, 3:6, ...]
-            metrics["cVAE/sampled_images3"] = sampled_obs[:3, 6:9, ...]
+            metrics["cVAE/sampled_images1"] = sampled_obs[:10, :3, ...]
+            metrics["cVAE/sampled_images2"] = sampled_obs[:10, 3:6, ...]
+            metrics["cVAE/sampled_images3"] = sampled_obs[:10, 6:9, ...]
 
-            metrics["cVAE/sampled_next_images1"] = sampled_next_obs[:3, :3, ...]
-            metrics["cVAE/sampled_next_images2"] = sampled_next_obs[:3, 3:6, ...]
-            metrics["cVAE/sampled_next_images3"] = sampled_next_obs[:3, 6:9, ...]
+            metrics["cVAE/sampled_next_images1"] = sampled_next_obs[:10, :3, ...]
+            metrics["cVAE/sampled_next_images2"] = sampled_next_obs[:10, 3:6, ...]
+            metrics["cVAE/sampled_next_images3"] = sampled_next_obs[:10, 6:9, ...]
 
-            with torch.no_grad():
-                obs = self.reconstructor.encode(images)
-                next_obs = self.reconstructor.encode(next_images)
+            #obs = self.reconstructor.encode(images)
+            #next_obs = self.reconstructor.encode(next_images)
+            obs = self.image_encoder(images, flatten=True)
+            next_obs = self.image_encoder(next_images, flatten=True)
 
             action = torch.tile(action, (2, 1))
             reward = torch.tile(reward, (2, 1))
             discount = torch.tile(discount, (2, 1))
+
+            if SHUFFLE:
+                indices = torch.randperm(images.size(0))
+                images = images[indices].squeeze(1)
+                next_images = next_images[indices].squeeze(1)
+                action = action[indices]
+                reward = reward[indices]
+                discount = discount[indices]
 
         else:
             raise("Just STAGE_1 and STAGE_2")
@@ -588,8 +698,13 @@ class DrQV2Agent:
         if STAGE_1:
             metrics.update(self.update_actor(obs.detach(), step))
         elif STAGE_2:
-            states_feats = self.state_encoder(states)
-            metrics.update(self.update_actor(obs.detach(), step, states_feats=states_feats))
+            states_feats = None
+            if REGULARIZE_ACTOR:
+                with torch.no_grad():
+                    states_feats = self.state_encoder(states)
+                metrics.update(self.update_actor(obs.detach(), step, states_feats=states_feats.detach()))
+            else:
+                metrics.update(self.update_actor(obs.detach(), step))
         else:
             raise("Just STAGE_1 and STAGE_2")
 
@@ -602,50 +717,34 @@ class DrQV2Agent:
 
         # NOTE (important): This needs to be after the updates to the above policies to train properly!!!
         # update reconstruction
-        if STAGE_1:
-            # try to select the top reward images
-            best_indices = torch.argsort(reward, descending=True, dim=0)[:100]
-            high_reward_images = images[best_indices].squeeze(1)
-            high_reward_images_next = next_images[best_indices].squeeze(1)
+        if STAGE_1 and WITH_RECONSTRUCTION:
+            actions_norm = action / action.norm(dim=-1, keepdim=True)
+            reward_norm = reward / reward.norm(dim=-1, keepdim=True)
 
-            #sampled_obs = torch.cat([next_images, high_reward_images], dim=0)
-            high_rewards = reward[best_indices].squeeze(1)
-            high_actions = action[best_indices].squeeze(1)
+            if HIGH_REWARD:
+                # try to select the top reward images
+                best_indices = torch.argsort(reward, descending=True, dim=0)[:100]
+                high_reward_images = images[best_indices].squeeze(1)
+                high_reward_images_next = next_images[best_indices].squeeze(1)
 
-            # debug
-            #print(f"{high_rewards.mean()}, {high_rewards.min()}, {high_rewards.max()}")
-            #print(high_rewards.flatten())
-            # debug
-            
-            #self.cVAE_opt.zero_grad()
-            ###NUM_ITERS = 3
-            ###for _ in range(NUM_ITERS):
-            ## actions_norm = action / action.norm(dim=-1, keepdim=True)
-            ## reward_norm = reward / reward.norm(dim=-1, keepdim=True)
-            ## images = images
-            
-            actions_norm = high_actions / high_actions.norm(dim=-1, keepdim=True)
-            reward_norm = high_rewards / high_rewards.norm(dim=-1, keepdim=True)
-            images = high_reward_images
-            next_images = high_reward_images_next
+                #sampled_obs = torch.cat([next_images, high_reward_images], dim=0)
+                high_rewards = reward[best_indices].squeeze(1)
+                high_actions = action[best_indices].squeeze(1)
+                
+                actions_norm = high_actions / high_actions.norm(dim=-1, keepdim=True)
+                reward_norm = high_rewards / high_rewards.norm(dim=-1, keepdim=True)
+                images = high_reward_images
+                next_images = high_reward_images_next
 
-            #TODO: augment??? (shift + noise) --> THIS WORKS WELL
-            #images_aug = self.aug_noise(self.aug(images[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2]).float()))
-            # images_aug = self.aug(images[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2]).float())
-            # images_aug = images_aug.view(-1, self.flat_image_shape)
-            # images = torch.cat([images, images_aug], dim=0)
-            # actions_norm = torch.cat([actions_norm, actions_norm], dim=0)
-            # reward_norm = torch.cat([reward_norm, reward_norm], dim=0)
+            if AUGMENT:
+                # NOTE: AUGMENT (shift and/or noise)
+                #images_aug = self.aug_noise(self.aug(images[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2]).float()))
+                images_aug = self.aug(images[:, :self.flat_image_shape].view(-1, self.image_shape[0], self.image_shape[1], self.image_shape[2]).float())
+                images_aug = images_aug.view(-1, self.flat_image_shape)
+                images = torch.cat([images, images_aug], dim=0)
+                actions_norm = torch.cat([actions_norm, actions_norm], dim=0)
+                reward_norm = torch.cat([reward_norm, reward_norm], dim=0)
 
-
-
-
-
-            #TODO: shuffle???
-            # shuffled_indices = torch.randperm(actions_norm.size(0))
-            # actions_norm = actions_norm[shuffled_indices]
-            # reward_norm = reward_norm[shuffled_indices]
-            # images = images[shuffled_indices]
 
             # NOTE (experiment): Discriminator step
             #discriminator_metrics = self.update_discrimination(obs=images, actions=actions_norm, rewards=reward_norm, step=step, num_steps=num_steps)
@@ -655,19 +754,25 @@ class DrQV2Agent:
             reconstruction_metrics = self.update_reconstruction(obs=images, next_obs=next_images, actions=actions_norm, rewards=reward_norm, step=step, num_steps=num_steps)
             metrics.update(reconstruction_metrics)
 
-                ###batch = next(replay_iter)
-                ###obs, action, reward, discount, next_obs = utils.to_torch(batch, self.device)
-                ###images = obs[:, :self.flat_image_shape]
-
-            ### self.cVAE_opt.step()
+            # NOTE: Validate sampled output from Normal
+            if step == 2000 or step % LOG_EVERY == 0:
+                sampled_obs = self.reconstructor.sample(context_actions=actions_norm, context_rewards=reward_norm)
+                metrics["cVAE_val/sampled_images1"] = sampled_obs[:10, :3, ...]
+                metrics["cVAE_val/sampled_images2"] = sampled_obs[:10, 3:6, ...]
+                metrics["cVAE_val/sampled_images3"] = sampled_obs[:10, 6:9, ...]
 
         elif STAGE_2:
-            # might not be turned on
-            reconstruction_metrics = self.update_reconstruction(obs=images, next_obs=next_images, actions=action, rewards=reward, step=step, num_steps=num_steps)
-            metrics.update(reconstruction_metrics)
-            pass
-
-
-
+            if TRAIN_STAGE_2:
+                # might not be turned on
+                reconstruction_metrics = self.update_decoder(obs=images, next_obs=next_images, actions=action, rewards=reward, step=step, num_steps=num_steps)
+                metrics.update(reconstruction_metrics)        
 
         return metrics
+
+    def save_models(self, suffix=""):
+        if STAGE_1:
+            torch.save(self.actor.state_dict(), f"actor_weights{suffix}.pth")
+            torch.save(self.state_encoder.state_dict(), f"state_encoder_weights{suffix}.pth")
+            torch.save(self.reconstructor.state_dict(), f"cVAE_weights{suffix}.pth")
+        elif STAGE_2:
+            torch.save(self.reconstructor.state_dict(), f"cVAE_decoder_weights{suffix}.pth")
