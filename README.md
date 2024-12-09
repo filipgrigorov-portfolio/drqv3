@@ -19,9 +19,9 @@ This is an original PyTorch implementation of DrQ-v3, based on https://github.co
 
 ## Method
 DrQ-v3 is a model-free off-policy algorithm for image-based continuous control. DrQ-v3 builds on [DrQ-v2](https://github.com/facebookresearch/drqv2), an actor-critic approach that uses data augmentation to learn directly from pixels. We introduce several extensions including:
-- Two stage training regime, first on states and then on images
+- Two stage training regime
 - Image sampling instead of data augmentation.
-- A reconstruction auxiliary loss, in stage one and stage two (optional)
+- A reconstruction auxiliary loss, in stage one and optional continual fine-tuning in stage two
 - Pre-trained action policy regularization
 
 
