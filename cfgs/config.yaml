@@ -13,7 +13,7 @@ num_seed_frames: 4000
 eval_every_frames: 10000
 num_eval_episodes: 10
 # snapshot
-save_snapshot: false
+save_snapshot: false # save weights
 # replay buffer
 replay_buffer_size: 1000000
 replay_buffer_num_workers: 4
@@ -32,7 +32,7 @@ lr: 1e-4
 feature_dim: 50
 
 agent:
-  _target_: drqv2.DrQV2Agent
+  _target_: drqv3.DrQV3Agent
   obs_shape: ??? # to be specified later
   action_shape: ??? # to be specified later
   device: ${device}

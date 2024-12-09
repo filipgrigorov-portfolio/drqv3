@@ -15,6 +15,11 @@ from torch import distributions as pyd
 from torch.distributions.utils import _standard_normal
 
 
+def freeze_model(model):
+    for param in model.parameters():
+        if param.requires_grad:
+            param.requires_grad = False
+
 class eval_mode:
     def __init__(self, *models):
         self.models = models

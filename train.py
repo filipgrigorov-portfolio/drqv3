@@ -141,6 +141,7 @@ class Workspace:
 
         self.train_video_recorder.init(time_step.observation)
         metrics = None
+        last_reward = 0
         while train_until_step(self.global_step):
 
             if time_step.last():
@@ -160,6 +161,10 @@ class Workspace:
                         log('episode', self.global_episode)
                         log('buffer_size', len(self.replay_storage))
                         log('step', self.global_step)
+
+                    if last_reward < episode_reward:
+                        last_reward = episode_reward
+                        self.agent.save_models()
 
                 # reset env
                 time_step = self.train_env.reset()
@@ -185,7 +190,7 @@ class Workspace:
 
             # NOTE (informative): try to update the agent (UPDATE)
             if not seed_until_step(self.global_step):
-                metrics = self.agent.update(self.replay_iter, self.global_step)
+                metrics = self.agent.update(self.replay_iter, self.global_step, self.cfg.num_train_frames)
                 self.logger.log_metrics(metrics, self.global_frame, ty='train')
 
             # take env step
@@ -193,10 +198,11 @@ class Workspace:
             episode_reward += time_step.reward
             self.replay_storage.add(time_step)
 
-
             self.train_video_recorder.record(time_step.observation)
             episode_step += 1
             self._global_step += 1
+
+        self.agent.save_models(suffix="_last")
 
     def save_snapshot(self):
         snapshot = self.work_dir / 'snapshot.pt'
