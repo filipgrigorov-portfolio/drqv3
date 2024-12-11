@@ -24,7 +24,7 @@ from PIL import Image
 STAGE_1 = True
 STAGE_2 = False
 
-LOG_EVERY = 20000
+LOG_EVERY = 200000
 NUM_ACC_STEPS = 1000
 UPDATE_DISCRIMINATOR_EVERY = 300
 
@@ -296,10 +296,10 @@ class DrQV3Agent:
 
         if STAGE_2 and REGULARIZE_ACTOR:
             B = obs.size(0) // 2
-            actor_kl_reg = compute_kl_divergence_on_behaviour_policy(self.actor, self.pretrained_actor, images_feats=obs[:B, ...], states_feats=states_feats, std=stddev)
+            actor_kl_reg = compute_kl_divergence_on_behaviour_policy(self.actor, self.pretrained_actor, images_feats=obs, states_feats=states_feats, std=stddev)#images_feats=obs[:B, ...], states_feats=states_feats, std=stddev)
             if self.use_tb:
                 metrics['actor_kl_reg'] = actor_kl_reg.item()
-            actor_loss = actor_loss + actor_kl_reg
+            actor_loss = actor_loss + GAMMA * actor_kl_reg # TRYING ------
 
         # NOTE (informative): optimize actor
         self.actor_opt.zero_grad(set_to_none=True)
@@ -650,29 +650,33 @@ class DrQV3Agent:
             sampled_obs = self.reconstructor.sample(context_actions=actions_norm, context_rewards=reward_norm)
             # The actions and rewards are more or less similar for immediate next state
             # TODO: Use latent dynamics to decode the next obs
-            sampled_next_obs = self.reconstructor.sample(context_actions=actions_norm, context_rewards=reward_norm)
+            # sampled_next_obs = self.reconstructor.sample(context_actions=actions_norm, context_rewards=reward_norm)
 
-            images = torch.cat([images, sampled_obs], dim=0)
-            next_images = torch.cat([next_images, sampled_next_obs], dim=0)
-            reward_norm = torch.tile(reward_norm, (2, 1))
-            actions_norm = torch.tile(actions_norm, (2, 1))
+            batch_half_size = images.size(0) // 2
+            replace_indices = torch.randperm(images.size(0))[:batch_half_size]
+            images[replace_indices] = sampled_obs[:batch_half_size]
+
+            # images = torch.cat([images, sampled_obs], dim=0)
+            # next_images = torch.cat([next_images, next_images], dim=0)
+            # reward_norm = torch.tile(reward_norm, (2, 1))
+            # actions_norm = torch.tile(actions_norm, (2, 1))
             
             metrics["cVAE/sampled_images1"] = sampled_obs[:10, :3, ...]
             metrics["cVAE/sampled_images2"] = sampled_obs[:10, 3:6, ...]
             metrics["cVAE/sampled_images3"] = sampled_obs[:10, 6:9, ...]
 
-            metrics["cVAE/sampled_next_images1"] = sampled_next_obs[:10, :3, ...]
-            metrics["cVAE/sampled_next_images2"] = sampled_next_obs[:10, 3:6, ...]
-            metrics["cVAE/sampled_next_images3"] = sampled_next_obs[:10, 6:9, ...]
+            # metrics["cVAE/sampled_next_images1"] = sampled_next_obs[:10, :3, ...]
+            # metrics["cVAE/sampled_next_images2"] = sampled_next_obs[:10, 3:6, ...]
+            # metrics["cVAE/sampled_next_images3"] = sampled_next_obs[:10, 6:9, ...]
 
             #obs = self.reconstructor.encode(images)
             #next_obs = self.reconstructor.encode(next_images)
             obs = self.image_encoder(images, flatten=True)
-            next_obs = self.image_encoder(next_images, flatten=True)
+            next_obs = self.image_encoder(next_images, flatten=True) # TODO: try the cVAE imag encoder
 
-            action = torch.tile(action, (2, 1))
-            reward = torch.tile(reward, (2, 1))
-            discount = torch.tile(discount, (2, 1))
+            #action = torch.tile(action, (2, 1))
+            #reward = torch.tile(reward, (2, 1))
+            #discount = torch.tile(discount, (2, 1))
 
             if SHUFFLE:
                 indices = torch.randperm(images.size(0))
